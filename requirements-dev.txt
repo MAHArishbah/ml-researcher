@@ -1,0 +1,3 @@
+-r requirements.txt
+ruff
+deepeval==4.3.2      # python -m ml_researcher.evaluate generation

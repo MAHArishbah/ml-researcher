@@ -1,0 +1,25 @@
+[project]
+name = "ml-researcher"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["__pycache__"]
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I import order, B bugbear, UP pyupgrade, SIM simplify, RUF ruff-specific
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = [
+    "E731",    # lambda assignments are used on purpose for small callbacks
+    "RUF001",  # ambiguous unicode in strings: the UI uses ✓ ⚠ ✗ ▌ … on purpose
+    "RUF003",  # same, in comments
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ml_researcher"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*" = ["E402"]   # sys.path tweak before importing ml_researcher
+"ml_researcher/vectordb.py" = ["F401"]   # re-exports the chosen backend; --fix would delete them
