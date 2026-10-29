@@ -210,7 +210,7 @@ Run evaluations after an ingest has finished. While an ingest is running, every 
 
 ### Results (29 October 2026)
 
-Retrieval on the 100-question golden set (75 single-hop, 25 multi-hop), with 39k chunks in the index. Chunk level: the exact gold passage must be retrieved.
+Retrieval on the 100-question golden set (75 single-hop, 25 multi-hop), with 42,527 chunks in the index (the questions were sampled when it held 39,154). Chunk level: the exact gold passage must be retrieved.
 
 | Metric | **Rerank** (hybrid + Cohere, 15 → 5) | Hybrid (vector + BM25) | Vector only |
 |---|---|---|---|
