@@ -7,8 +7,18 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 PROJECT=os.environ["GOOGLE_CLOUD_PROJECT"]
 LOCATION=os.getenv("GOOGLE_CLOUD_LOCATION","global")
-MODEL=os.getenv("RESEARCH_MODEL","gemini-3.8-flash")
-RESEARCHER_MODEL=os.getenv("RESEARCHER_MODEL",MODEL)
+
+def _spec(value: str) -> str:
+    """Models are "provider:model" (e.g. "anthropic:claude-sonnet-5-5"); a bare name means Gemini."""
+    return value if ":" in value else f"google_genai:{value}"
+
+
+MAIN_MODEL = _spec(os.getenv("MAIN_MODEL") or os.getenv("RESEARCH_MODEL", "gemini-3.8-flash"))   # router, planner,
+RESEARCHER_MODEL = _spec(os.getenv("RESEARCHER_MODEL") or MAIN_MODEL)     # reviewer, synthesizer, answers | researchers
+JUDGE_MODEL = _spec(os.getenv("JUDGE_MODEL") or MAIN_MODEL)               # evaluate: golden-set writer + DeepEval judge
+VISION_MODEL = _spec(os.getenv("VISION_MODEL") or RESEARCHER_MODEL)       # image captions during ingest
+CODE_SANDBOX = os.getenv("CODE_SANDBOX", "auto").lower()                  # auto (MAIN_MODEL's provider) | google_genai
+                                                                          # | anthropic | none
 
 VECTOR_BACKEND=os.getenv("VECTOR_BACKEND","chroma").lower()
 DOCS_DIR = Path(os.getenv("LOCAL_DOCS_DIR", "/mnt/e/AI_ML"))
@@ -19,6 +29,8 @@ EMBED_WORKERS = int(os.getenv("EMBED_WORKERS", "4"))
 FILE_WORKERS = int(os.getenv("FILE_WORKERS", "2"))
 HYBRID = os.getenv("HYBRID_SEARCH", "true").lower() == "true"
 HNSW_EF_SEARCH = int(os.getenv("HNSW_EF_SEARCH", "100"))
+LLM_RPS = float(os.getenv("LLM_RPS") or os.getenv("GEMINI_RPS", "5"))  # max model calls/s per process; 0 = no limit
+BATCH_RPS = float(os.getenv("BATCH_RPS", "1"))       # stricter pace for batch jobs (ingest, evaluate)
 RERANK = os.getenv("RERANK", "true").lower() == "true"            # needs COHERE_API_KEY
 RERANK_MODEL = os.getenv("RERANK_MODEL", "rerank-v5.0-pro")
 RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "15"))     # fused hits sent to the reranker

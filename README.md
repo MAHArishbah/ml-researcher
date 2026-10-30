@@ -27,7 +27,7 @@ After the first pass, a **reviewer** looks for gaps. For example, a video might 
   - each (source, query) is hashed with word order ignored, so a reworded repeat is blocked;
   - a round that brings no new raw results ends the cycle.
 
-**Python checks run in Gemini's hosted code-execution sandbox:** no network, none of your files. Code a model writes is never run on your machine; only the task and the findings text are sent. Expect about 60 s per check.
+**Python checks run in the model provider's hosted sandbox** (Gemini or Claude code execution, see `sandbox.py`): no network, none of your files. Code a model writes is never run on your machine; only the task and the findings text are sent. Expect up to about 60 s per check. With `CODE_SANDBOX=none`, Python checks are switched off.
 
 ## Setup
 
@@ -49,8 +49,9 @@ Copy `.env.example` to `.env` and fill in your project ID and keys. `.env` is in
 GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_GENAI_USE_VERTEXAI=TRUE
 GOOGLE_CLOUD_LOCATION=global
-RESEARCH_MODEL=gemini-3.8-flash          # router, planner, synthesizer, answers
-RESEARCHER_MODEL=gemini-3.5-flash-lite   # the 4 researchers + image captions
+MAIN_MODEL=google_genai:gemini-3.8-flash          # router, planner, reviewer, synthesizer, answers
+RESEARCHER_MODEL=google_genai:gemini-3.5-flash-lite   # the 4 researchers + image captions
+# Claude instead: MAIN_MODEL=anthropic:claude-sonnet-5-5 and ANTHROPIC_API_KEY=...  (embeddings stay on Gemini)
 EMBED_MODEL=gemini-embedding-2
 EMBED_DIM=768
 LOCAL_DOCS_DIR=/mnt/e/AI_ML              # default folder for ingest
@@ -74,6 +75,11 @@ LOG_TO_GCP=true                          # optional, see Monitoring
 | `RERANK` | `true` | use the Cohere reranker when a key is set |
 | `RERANK_MODEL` | `rerank-v5.0-pro` | Cohere rerank model |
 | `RERANK_CANDIDATES` | `15` | candidates from fused vector + keyword search that the reranker orders; the top 5 are returned |
+| `MAIN_MODEL`, `RESEARCHER_MODEL` | Gemini 3.8 Flash, 3.5 Flash Lite | `provider:model` (`google_genai:…` or `anthropic:…`); a bare name means Gemini |
+| `JUDGE_MODEL`, `VISION_MODEL` | `MAIN_MODEL`, `RESEARCHER_MODEL` | eval judge and question writer; image captions (any multimodal model) |
+| `CODE_SANDBOX` | `auto` | hosted Python for checks: `auto` uses `MAIN_MODEL`'s provider; `none` switches checks off |
+| `LLM_RPS` | `5` | maximum model calls per second per process (chat, UI), spaced evenly; `0` means no limit (`GEMINI_RPS` still works) |
+| `BATCH_RPS` | `1` | stricter pace that `ingest` and `evaluate` switch to, for long runs |
 | `CHECKPOINT_DB` | `~/.ml_researcher/checkpoints.sqlite` | saved conversations |
 | `LOG_DIR` | `~/.ml_researcher/logs` | local JSON logs |
 | `LOG_LEVEL` | `INFO` | |
@@ -176,7 +182,7 @@ It's safe to re-run: metrics are updated and the dashboard is replaced.
 ```bash
 python -m ml_researcher.evaluate build --root /mnt/e/AI_ML/ML --n 100   # golden set, run once (about 10 min)
 python -m ml_researcher.evaluate retrieval                               # about 1 s per question per mode
-python -m ml_researcher.evaluate generation --limit 30 --workers 8       # slow: about 8 LLM calls per question
+bash scripts/run_eval.sh 30          # generation eval as a detached batch job: 30 questions, resumable
 ```
 
 **Golden set** (`evals/golden.jsonl`): Gemini writes questions with reference answers from random chunks of random indexed files. It skips tables of contents, reference lists and fragments. The default mix is 75% single-hop and 25% multi-hop:
@@ -228,7 +234,24 @@ Retrieval on the 100-question golden set (75 single-hop, 25 multi-hop), with 42,
 - **Multi-hop is the weak spot:** both pieces of evidence reach the top 5 less than half the time. The reviewer's follow-up searches are meant to cover this.
 - **A rerank call takes about 0.5 s on its own.** The eval measured 5.5 s per query because Cohere throttled the parallel workers.
 
-Generation metrics (faithfulness, answer relevancy, answer correctness) are pending. The full run of all 100 questions is in progress, and results will appear in `evals/runs/`.
+**Generation** (30 October 2026, the first 30 golden questions: 24 single-hop and 6 multi-hop). Answers come from the top 5 reranked full chunks, with `gemini-3.8-flash` as both answerer and DeepEval judge, paced at 1 call per second. Run: `evals/runs/20261030-153656-generation/`.
+
+| Metric | All | Single-hop | Multi-hop | Pass rate at 0.5 |
+|---|---|---|---|---|
+| Faithfulness | **0.99** | 1.00 | 0.96 | 100% |
+| Answer relevancy | **1.00** | 1.00 | 1.00 | 100% |
+| Answer correctness | **0.95** | 0.95 | 0.97 | 100% |
+
+- **22 of 30 answers are fully correct.** The lowest scores (0.7) are an answer that added an incorrect variant of the Bellman target, and one that missed some of the reference's key points.
+- **Only one answer has an unsupported claim:** a multi-hop question, with faithfulness 0.75.
+- **No answer fell back to "the notes don't cover this".** Even when the exact gold chunk missed the top 5, neighbouring or duplicate chunks carried enough of the answer.
+
+**Read these as an upper bound:**
+- **The same model wrote the golden questions, answered them and judged them,** which tends to inflate scores (self-preference).
+- **Scores near 1.0 leave little room to show improvements.**
+- **30 questions give wide error bars,** and only 6 of them are multi-hop.
+
+A judge from another provider (`JUDGE_MODEL=anthropic:…`) and harder, human-checked questions would give a more trustworthy number.
 
 ## Performance
 
@@ -279,15 +302,17 @@ ruff format --diff .  # preview formatting changes (ruff format . applies them)
 |---|---|
 | `ui.py` | Streamlit app |
 | `ml_researcher/graph.py` | the agent graph: router, planner, guarded researchers, reviewer and follow-ups, Python checks, synthesizer, answer |
-| `ml_researcher/cache.py` | explicit Gemini prefix caching: findings shared by reviewer and synthesizer, and the conversation up to the latest brief for follow-ups. Used only above Vertex's 4,096-token minimum; otherwise a normal call. |
+| `ml_researcher/cache.py` | prompt caching per provider: Gemini explicit caches (only above Vertex's 4,096-token minimum) or Claude `cache_control` breakpoints, for the findings shared by reviewer and synthesizer and the conversation up to the latest brief |
 | `ml_researcher/guards.py` | hashes for tool calls, results and follow-ups (repeat and progress detection) |
 | `ml_researcher/tools.py` | arXiv, notes, GitHub and YouTube search tools |
 | `ml_researcher/runner.py` | runs one turn: streaming, cancellation, telemetry |
 | `ml_researcher/chat.py` | terminal chat |
-| `ml_researcher/llm.py` | Gemini chat models |
+| `ml_researcher/llm.py` | provider-agnostic chat models: `chat_model("provider:model", effort)`, one `effort` setting mapped to each provider|
+| `ml_researcher/sandbox.py` | hosted Python sandboxes behind one interface (Gemini or Claude code execution) |
+| `ml_researcher/ratelimit.py` | one shared pace for all model calls; batch jobs drop to `BATCH_RPS` |
 | `ml_researcher/ingest.py` | indexing pipeline (LangGraph map-reduce over files) |
 | `ml_researcher/readers.py` | PDF, DOCX, PPTX and Markdown readers; chunking |
-| `ml_researcher/vision.py` | Gemini image captions, with cache |
+| `ml_researcher/vision.py` | image captions with any multimodal model (`VISION_MODEL`), with cache |
 | `ml_researcher/embeddings.py` | Gemini embeddings, with retry |
 | `ml_researcher/store_chroma.py`, `hybrid.py` | local vector store, BM25 keyword search, rank fusion |
 | `ml_researcher/rerank.py` | Cohere reranker: 15 fused candidates down to the top 5 |

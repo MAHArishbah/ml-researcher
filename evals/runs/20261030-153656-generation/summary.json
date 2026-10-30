@@ -1,0 +1,40 @@
+{
+  "params": {
+    "cmd": "generation",
+    "golden": "/mnt/e/AI_ML/Prac/researchAgent/evals/golden.jsonl",
+    "limit": 30,
+    "workers": 2,
+    "top_k": 5,
+    "resume": null
+  },
+  "summary": {
+    "all": {
+      "n": 30,
+      "faithfulness": 0.992,
+      "faithfulness_pass_rate": 1.0,
+      "answer_relevancy": 1.0,
+      "answer_relevancy_pass_rate": 1.0,
+      "answer_correctness": 0.953,
+      "answer_correctness_pass_rate": 1.0
+    },
+    "single": {
+      "n": 24,
+      "faithfulness": 1.0,
+      "faithfulness_pass_rate": 1.0,
+      "answer_relevancy": 1.0,
+      "answer_relevancy_pass_rate": 1.0,
+      "answer_correctness": 0.95,
+      "answer_correctness_pass_rate": 1.0
+    },
+    "multi_hop": {
+      "n": 6,
+      "faithfulness": 0.958,
+      "faithfulness_pass_rate": 1.0,
+      "answer_relevancy": 1.0,
+      "answer_relevancy_pass_rate": 1.0,
+      "answer_correctness": 0.967,
+      "answer_correctness_pass_rate": 1.0
+    },
+    "errors": 0
+  }
+}

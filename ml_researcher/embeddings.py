@@ -4,6 +4,7 @@ import numpy as np
 import time
 import httpx
 from google.genai import errors
+from . import ratelimit
 
 
 _client=genai.Client(vertexai=True,project=PROJECT,location=LOCATION)
@@ -19,6 +20,7 @@ def embed(text:str,kind:str) -> np.ndarray:
     last_err:Exception| None =None
     for attempt in range(5):
         try:
+            ratelimit.wait()                    # every attempt, retries included, counts against the pace
             resp=_client.models.embed_content(
                 model=EMBED_MODEL,
                 contents=payload,

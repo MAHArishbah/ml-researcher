@@ -17,6 +17,7 @@ import math
 import os
 import random
 import sys
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -28,9 +29,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from tqdm import tqdm
 
-from . import config, rerank, store_chroma
-from .config import DOCS_DIR, MODEL
-from .llm import gemini, text_of
+from . import config, ratelimit, rerank, store_chroma
+from .config import DOCS_DIR, JUDGE_MODEL, MAIN_MODEL
+from .llm import chat_model, structured, text_of
+from .logging_config import setup_logging
 from .readers import to_wsl_path
 
 EVAL_DIR = Path(__file__).resolve().parent.parent / "evals"      # golden set + runs/, kept in the project
@@ -40,8 +42,9 @@ MIN_CHARS = 500                  # skip tiny chunks (titles, captions) as questi
 DUPLICATE_SIM = 0.97             # a multi-hop partner this similar is a copy, not a second hop
 WORKERS = 4                      # default parallel LLM/search calls (--workers)
 
-WRITER = gemini(MODEL, thinkin_level="low")   # writes golden Q/A and the answers under test
-JUDGE = gemini(MODEL, thinkin_level="low")    # DeepEval judge
+WRITER = chat_model(JUDGE_MODEL, effort="low")      # writes the golden Q/A pairs
+JUDGE = chat_model(JUDGE_MODEL, effort="low")       # DeepEval judge
+ANSWERER = chat_model(MAIN_MODEL, effort="low")     # produces the answers under test (the app's model)
 
 
 # ---------------------------------------------------------------- golden set
@@ -112,7 +115,7 @@ def _write_item(cand: dict) -> dict | None:
     qa = None
     for attempt in (1, 2):                                   # occasional empty/invalid JSON: retry once
         try:
-            qa = WRITER.with_structured_output(QA).invoke(msgs)
+            qa = structured(WRITER, QA).invoke(msgs)
             break
         except Exception as e:
             if attempt == 2:
@@ -295,7 +298,7 @@ def _answer(item: dict, top_k: int) -> dict:
     hits = store_chroma.search(item["question"], top_k=top_k)
     contexts = [h["text"] for h in hits]                  # exactly what the agent's notes tool sees
     notes = "\n\n".join(f"[{n}] ({h['name']})\n{h['text']}" for n, h in enumerate(hits, 1))
-    reply = WRITER.invoke([SystemMessage(ANSWER_PROMPT),
+    reply = ANSWERER.invoke([SystemMessage(ANSWER_PROMPT),
                            HumanMessage(f"Excerpts:\n{notes}\n\nQuestion: {item['question']}")])
     return {"contexts": contexts, "answer": text_of(reply)}
 
@@ -303,8 +306,8 @@ def _answer(item: dict, top_k: int) -> dict:
 def _deepeval_judge():
     from deepeval.models import DeepEvalBaseLLM
 
-    class GeminiJudge(DeepEvalBaseLLM):
-        """DeepEval judge backed by the project's Vertex AI Gemini chat model."""
+    class LangChainJudge(DeepEvalBaseLLM):
+        """DeepEval judge backed by any LangChain chat model (JUDGE_MODEL)."""
 
         def __init__(self, llm):
             self.llm = llm
@@ -316,7 +319,7 @@ def _deepeval_judge():
         def generate(self, prompt: str, schema=None):
             if schema is not None:
                 try:
-                    out = self.llm.with_structured_output(schema).invoke(prompt)
+                    out = structured(self.llm, schema).invoke(prompt)
                     if out is not None:
                         return out
                 except Exception:
@@ -327,9 +330,9 @@ def _deepeval_judge():
             return self.generate(prompt, schema)
 
         def get_model_name(self):
-            return f"vertex/{self.llm.model}"
+            return JUDGE_MODEL
 
-    return GeminiJudge(JUDGE)
+    return LangChainJudge(JUDGE)
 
 
 def _metrics(judge) -> dict:
@@ -376,10 +379,23 @@ def _evaluate_one(item: dict, top_k: int, judge) -> dict:
 def generation(args):
     golden = load_golden(args.golden)[: args.limit]
     judge = _deepeval_judge()
-    run = _run_dir("generation")
+    run = Path(args.resume) if args.resume else _run_dir("generation")
+    partial = run / "per_query.jsonl"
+    done = load_golden(partial) if partial.exists() else []          # rows finished by an earlier attempt
+    done_ids = {r["qid"] for r in done}
+    todo = [it for it in golden if it["qid"] not in done_ids]
+    print(f"{run} | {len(done)} already done, {len(todo)} to go")
+    lock = threading.Lock()
+
+    def evaluate_and_append(item):                    # each row is saved as soon as it's judged
+        row = _evaluate_one(item, args.top_k, judge)
+        with lock, partial.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return row
+
     with ThreadPoolExecutor(args.workers) as ex:
-        rows = list(tqdm(ex.map(lambda it: _evaluate_one(it, args.top_k, judge), golden),
-                         total=len(golden), desc="answer + judge", dynamic_ncols=True))
+        rows = done + list(tqdm(ex.map(evaluate_and_append, todo),
+                                total=len(todo), desc="answer + judge", dynamic_ncols=True))
     names = ["faithfulness", "answer_relevancy", "answer_correctness"]
     summary = {}
     for g in ("all", "single", "multi_hop"):
@@ -391,7 +407,7 @@ def generation(args):
             summary[g][f"{name}_pass_rate"] = round(sum(v >= 0.5 for v in vals) / len(vals), 3) if vals else None
     summary["errors"] = sum("error" in r or any(r.get(n) is None for n in names) for r in rows)
 
-    print(f"\n{len(rows)} questions | top_k={args.top_k} | judge {JUDGE.model} | errors {summary['errors']}")
+    print(f"\n{len(rows)} questions | top_k={args.top_k} | judge {JUDGE_MODEL} | answers {MAIN_MODEL} | errors {summary['errors']}")
     print(f"{'metric':<22}{'all':>10}{'1-hop':>10}{'multi-hop':>11}   (mean score, pass rate at 0.5)")
     for name in names:
         cells = [summary[g][name] for g in ("all", "single", "multi_hop")]
@@ -436,7 +452,11 @@ def main():
     sub.choices["retrieval"].add_argument("--modes", default="rerank,hybrid,vector",
                                           help="comma list of: rerank (hybrid + Cohere), hybrid, vector")
     sub.choices["generation"].add_argument("--top-k", type=int, default=5, help="passages given to the answerer")
+    sub.choices["generation"].add_argument("--resume", default=None,
+                                           help="run folder of an interrupted generation run: skip finished questions")
     args = ap.parse_args()
+    setup_logging(app="evaluate")
+    ratelimit.batch_mode()                       # long jobs: steady, low request rate
     {"build": build, "retrieval": retrieval, "generation": generation}[args.cmd](args)
 
 

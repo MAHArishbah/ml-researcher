@@ -18,7 +18,7 @@ from tqdm import tqdm
 import time
 import logging
 
-from . import vectordb
+from . import ratelimit, vectordb
 from .config import DOCS_DIR, FILE_WORKERS, VECTOR_BACKEND
 from .readers import to_wsl_path, walk
 from .logging_config import setup_logging
@@ -95,6 +95,7 @@ def build_ingest_graph():
 
 def main():
     setup_logging(app="ingest")
+    ratelimit.batch_mode()                       # long jobs: steady, low request rate
     ap = argparse.ArgumentParser(description="Recursively index PDF/Word/Markdown files.")
     ap.add_argument("folders", nargs="*", help="folders to index (Linux or Windows paths)")
     args = ap.parse_args()
