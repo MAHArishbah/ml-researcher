@@ -298,30 +298,58 @@ ruff format --diff .  # preview formatting changes (ruff format . applies them)
 
 ## Project layout
 
+**Apps**
+
 | Path | What it does |
 |---|---|
-| `ui.py` | Streamlit app |
+| `ui.py` | Streamlit app: streaming replies, ⏹ Stop, LaTeX rendering, conversations in the sidebar |
+| `ml_researcher/chat.py` | terminal chat |
+| `ml_researcher/runner.py` | runs one turn: streaming, cancellation, telemetry (latency, TTFT, TPOT, tokens) |
+
+**Agent**
+
+| Path | What it does |
+|---|---|
 | `ml_researcher/graph.py` | the agent graph: router, planner, guarded researchers, reviewer and follow-ups, Python checks, synthesizer, answer |
-| `ml_researcher/cache.py` | prompt caching per provider: Gemini explicit caches (only above Vertex's 4,096-token minimum) or Claude `cache_control` breakpoints, for the findings shared by reviewer and synthesizer and the conversation up to the latest brief |
 | `ml_researcher/guards.py` | hashes for tool calls, results and follow-ups (repeat and progress detection) |
 | `ml_researcher/tools.py` | arXiv, notes, GitHub and YouTube search tools |
-| `ml_researcher/runner.py` | runs one turn: streaming, cancellation, telemetry |
-| `ml_researcher/chat.py` | terminal chat |
-| `ml_researcher/llm.py` | provider-agnostic chat models: `chat_model("provider:model", effort)`, one `effort` setting mapped to each provider|
-| `ml_researcher/sandbox.py` | hosted Python sandboxes behind one interface (Gemini or Claude code execution) |
-| `ml_researcher/ratelimit.py` | one shared pace for all model calls; batch jobs drop to `BATCH_RPS` |
-| `ml_researcher/ingest.py` | indexing pipeline (LangGraph map-reduce over files) |
-| `ml_researcher/readers.py` | PDF, DOCX, PPTX and Markdown readers; chunking |
+
+**Models: provider-agnostic, each provider behind its own adapter**
+
+| Path | What it does |
+|---|---|
+| `ml_researcher/llm.py` | chat models: `chat_model("provider:model", effort)` for Gemini (Vertex AI) or Claude; one `effort` setting mapped to each provider |
+| `ml_researcher/sandbox.py` | `CodeSandbox` interface for Python checks: Gemini or Claude **hosted** code execution, or none; code never runs locally |
+| `ml_researcher/cache.py` | prompt caching per provider: Gemini explicit caches (only above Vertex's 4,096-token minimum) or Claude `cache_control` breakpoints |
+| `ml_researcher/ratelimit.py` | one shared pace for all model calls (`LLM_RPS`); batch jobs drop to `BATCH_RPS` |
+| `ml_researcher/config.py` | all settings, read from `.env` |
+
+**Notes search and ingestion**
+
+| Path | What it does |
+|---|---|
+| `ml_researcher/ingest.py` | indexing pipeline (LangGraph map-reduce over files), incremental by modification time |
+| `ml_researcher/readers.py` | PDF, DOCX, PPTX and Markdown readers; paragraph- and sentence-aware chunking |
 | `ml_researcher/vision.py` | image captions with any multimodal model (`VISION_MODEL`), with cache |
 | `ml_researcher/embeddings.py` | Gemini embeddings, with retry |
-| `ml_researcher/store_chroma.py`, `hybrid.py` | local vector store, BM25 keyword search, rank fusion |
+| `ml_researcher/store_chroma.py`, `hybrid.py` | local vector store; BM25 keyword search and rank fusion |
 | `ml_researcher/rerank.py` | Cohere reranker: 15 fused candidates down to the top 5 |
-| `ml_researcher/store_rag.py`, `vectordb.py` | Vertex AI RAG Engine backend; backend switch |
+| `ml_researcher/store_rag.py`, `vectordb.py` | Vertex AI RAG Engine backend (optional); backend switch |
 | `ml_researcher/render.py` | converts model Markdown and LaTeX into what Streamlit renders |
-| `ml_researcher/logging_config.py`, `log_report.py` | logging setup; local log summary |
-| `scripts/setup_gcp_metrics.py` | Cloud Monitoring metrics and dashboard |
 
-All runtime data lives in `~/.ml_researcher/`: the vector database, saved conversations, the caption cache and logs. Nothing is written to the project folder.
+**Evaluation, monitoring and scripts**
+
+| Path | What it does |
+|---|---|
+| `ml_researcher/evaluate.py` | golden-set builder; retrieval metrics; DeepEval generation metrics (resumable) |
+| `evals/golden.jsonl`, `evals/runs/` | the 100-question golden set, and every eval run's `summary.json` and `per_query.jsonl` |
+| `ml_researcher/logging_config.py`, `log_report.py` | logging setup (local JSON file and Cloud Logging); local p50/p95 summary |
+| `scripts/setup_gcp_metrics.py` | Cloud Monitoring log-based metrics and dashboard |
+| `scripts/daily_ingest.sh` | daily incremental re-index, run by Windows Task Scheduler |
+| `scripts/run_eval.sh` | generation eval as a detached, resumable batch job |
+| `test_readers.py`, `inspect_db.py` | check what one file extracts to; inspect the index (with an optional test search) |
+
+All runtime data lives in `~/.ml_researcher/`: the vector database, saved conversations, the caption cache and logs. The only exception is evaluation output, which is written to `evals/` in the project so it can be versioned.
 
 ## Troubleshooting
 
