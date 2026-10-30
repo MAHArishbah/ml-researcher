@@ -5,6 +5,7 @@ latency, TTFT (time to first reply token), TPOT (time per output token after the
 token usage, route, turn number and status / error_code.
 """
 import logging
+from collections import Counter
 import time
 import uuid
 from typing import Callable, Optional
@@ -108,8 +109,12 @@ def run_turn(graph, thread_id: str, prompt: str,
         values = graph.get_state(cfg).values
         turn = sum(isinstance(m, HumanMessage) for m in values.get("messages", []))
         tpot = (t_last - t_first) / (reply_tokens - 1) if t_first and reply_tokens > 1 else None
+        # tools run this turn; an answer-only turn runs none (the state still holds the last research turn's list)
+        calls = ((values.get("tool_calls") or []) + (["url_reader"] if values.get("read_url") else [])
+                 if values.get("route") == "research" else [])
         fields = {**ids, "event": "request", "status": status, "error_code": error_code, "error": error,
                   "route": values.get("route"), "turn": turn,
+                  "tool_calls": len(calls), "tool_call_counts": dict(Counter(calls)),
                   "latency_ms": _ms(latency),
                   "ttft_ms": _ms(t_first - t0 if t_first else None),
                   "tpot_ms": None if tpot is None else round(tpot * 1000, 2),

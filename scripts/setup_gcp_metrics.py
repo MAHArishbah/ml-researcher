@@ -54,6 +54,8 @@ METRICS = [
                  {"linearBuckets": {"numFiniteBuckets": 50, "width": 1, "offset": 0}}, ["route"]),
     distribution("output_tokens", "Output tokens per turn (all LLM calls, incl. reasoning)", REQ,
                  "output_tokens", "1", exp_buckets(1, 1.3, 64), ["route"]),
+    distribution("tool_calls", "Tools actually run per turn (searches, python checks, web search)", REQ,
+                 "tool_calls", "1", {"linearBuckets": {"numFiniteBuckets": 40, "width": 1, "offset": 0}}, ["route"]),
     distribution("input_tokens", "Input (prompt) tokens per turn, all LLM calls", REQ,
                  "input_tokens", "1", exp_buckets(1, 1.3, 64), ["route"]),
     distribution("reply_tokens", "Visible reply tokens per turn", REQ, "reply_tokens", "1",
@@ -74,10 +76,10 @@ def series(metric, reducer, legend, group_by=(), extra_filter="", aligner="ALIGN
                 "aggregation": agg}}}
 
 
-def p50_p95(title, metric, unit_label):
+def p50_p95(title, metric, unit_label, extra_filter=""):
     return {"title": title, "xyChart": {
-        "dataSets": [series(metric, "REDUCE_PERCENTILE_50", "p50"),
-                     series(metric, "REDUCE_PERCENTILE_95", "p95")],
+        "dataSets": [series(metric, "REDUCE_PERCENTILE_50", "p50", extra_filter=extra_filter),
+                     series(metric, "REDUCE_PERCENTILE_95", "p95", extra_filter=extra_filter)],
         "yAxis": {"label": unit_label, "scale": "LINEAR"}}}
 
 
@@ -101,6 +103,7 @@ def dashboard() -> dict:
         p50_p95("Turn number p50 / p95", "turns", "turn"),
         p50_p95("Output tokens per turn p50 / p95", "output_tokens", "tokens"),
         p50_p95("Input tokens per turn p50 / p95", "input_tokens", "tokens"),
+        p50_p95("Tool calls per research turn p50 / p95", "tool_calls", "calls", ' AND metric.label.route="research"'),
         {"title": "Requests by route (per 5 min)", "xyChart": {"dataSets": [
             {**series("requests", "REDUCE_SUM", "${metric.labels.route}", ["metric.label.route"]),
              "plotType": "STACKED_BAR"}]}},

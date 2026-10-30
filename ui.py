@@ -26,6 +26,7 @@ STEP_LABELS = {
     "notes_researcher": "Searched your notes",
     "github_researcher": "Searched GitHub",
     "youtube_researcher": "Searched YouTube",
+    "web_researcher": "Web search (only for /web questions)",
     "reviewer": "Reviewed findings for gaps",
     "followup": "Follow-up search or Python check",
     "synthesizer": "Wrote study brief",

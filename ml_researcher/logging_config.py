@@ -56,5 +56,11 @@ def setup_logging(app: str) -> logging.Logger:
 
     for noisy in ("httpx", "httpcore", "urllib3", "google_genai", "google.auth"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # the Gemini SDK logs each automatic retry ("Retrying ... as it raised ReadTimeout / 429") at INFO:
+    # keep those in our file so timeouts and rate limits leave a trace
+    retries = logging.getLogger("google_genai._api_client")
+    retries.setLevel(logging.INFO)
+    retries.addHandler(file_handler)
+    retries.propagate = False
     logger._configured = True
     return logger

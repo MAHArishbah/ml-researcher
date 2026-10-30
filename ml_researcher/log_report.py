@@ -43,6 +43,7 @@ def main():
     for key, label in [("latency_ms", "latency (ms)"), ("ttft_ms", "TTFT (ms)"), ("tpot_ms", "TPOT (ms/token)"),
                        ("reply_tokens", "reply tokens"), ("output_tokens", "output tokens (all)"),
                        ("input_tokens", "input tokens"), ("cached_tokens", "cached input tokens"),
+                       ("tool_calls", "tool calls"),
                        ("turn", "turn number")]:
         vals = [r[key] for r in requests if r.get(key) is not None]
         p50, p95 = pct(vals, 50), pct(vals, 95)

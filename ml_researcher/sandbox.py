@@ -10,7 +10,7 @@ from typing import Protocol
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from .config import CODE_SANDBOX, MAIN_MODEL
+from .config import CODE_SANDBOX, MAIN_MODEL, SANDBOX_TIMEOUT
 
 
 @dataclass
@@ -37,7 +37,7 @@ class GeminiSandbox:
     def __init__(self, spec: str):
         from .llm import chat_model
         self.name = f"gemini code execution ({spec})"
-        self.llm = chat_model(spec, effort="low").bind_tools([{"code_execution": {}}])
+        self.llm = chat_model(spec, effort="low", timeout=SANDBOX_TIMEOUT).bind_tools([{"code_execution": {}}])
 
     def run(self, system: str, prompt: str) -> SandboxRun:
         reply = self.llm.invoke([SystemMessage(system), HumanMessage(prompt)])
@@ -63,7 +63,7 @@ class AnthropicSandbox:
     def __init__(self, spec: str):
         from .llm import chat_model
         self.name = f"claude code execution ({spec})"
-        self.llm = chat_model(spec, effort="low").bind_tools([self.TOOL])
+        self.llm = chat_model(spec, effort="low", timeout=SANDBOX_TIMEOUT).bind_tools([self.TOOL])
 
     def run(self, system: str, prompt: str) -> SandboxRun:
         reply = self.llm.invoke([SystemMessage(system), HumanMessage(prompt)])

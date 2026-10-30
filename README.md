@@ -29,6 +29,28 @@ After the first pass, a **reviewer** looks for gaps. For example, a video might 
 
 **Python checks run in the model provider's hosted sandbox** (Gemini or Claude code execution, see `sandbox.py`): no network, none of your files. Code a model writes is never run on your machine; only the task and the findings text are sent. Expect up to about 60 s per check. With `CODE_SANDBOX=none`, Python checks are switched off.
 
+**Prompt-injection guards.** Tool output (abstracts, repo and video descriptions, text from your own files) is treated as untrusted:
+- **Tools can only search.** Nothing can write files, send messages or call arbitrary URLs, so injected text can at most mislead, never act.
+- **Tool output is marked as data.** It is wrapped in `<tool_result>` / `<findings>` tags, and the prompts say never to follow instructions inside them.
+- **Only verified links reach you.** Briefs keep only URLs that a tool returned in its structured `url` field, and follow-up answers only links already in the conversation. Anything else is stripped and logged as `url_removed`.
+- **Suspicious phrases are flagged.** Phrases like "ignore previous instructions" in tool or Python output are logged as `injection_suspect`, and a warning is attached for the model.
+- **Other limits:** secrets never enter prompts, Python runs only in the provider's sandbox, the UI never renders raw HTML, and code enforces the loop and follow-up limits whatever a model asks for.
+
+**Web search for new papers (`/web`).** Put `/web` anywhere in a question (for example `/web latest papers on flow matching`) to add a Gemini Google Search pass beside the four researchers. It is off for every other question, and `WEB_SEARCH=false` switches it off entirely. Guardrails:
+- **Gemini's written answer is discarded;** only its list of sources is used.
+- **Each source's real address** is read from Google's redirect without opening the page, and kept only if it's HTTPS on an allowlisted domain. Everything else is dropped.
+- **arXiv papers are re-fetched from the arXiv API,** so the title, authors, date and abstract come from arXiv, not the web page. Other allowed sites (OpenReview, GitHub, Hugging Face, NeurIPS/PMLR/ACL/CVF/JMLR proceedings) are passed as links only.
+- **At most 8 sources.** Only their verified URLs may appear in the brief, and each search is logged as `web_search`. A search takes about 15–100 s.
+
+**Read an article (`/read`).** Put `/read` and a link anywhere in the message, in any order (`/web` can be added too), for example `/read https://example.com/post how does this relate to my notes on superposition?`, reads that one page (a web page or PDF). The planner searches your notes for what the article discusses, and the brief starts with `## What the article says` and compares your notes with it (what they confirm, add or contradict). Guardrails (`urlreader.py`):
+- **Only the URL you typed is fetched.** The model can never request a fetch, and links on the page are never followed.
+- **HTTPS only.** The host and every redirect (at most 3) must resolve to public addresses, so localhost, your local network and cloud-metadata addresses are refused.
+- **Web pages (up to 10 MB) and PDFs (up to 15 MB) only,** with timeouts. Only text is kept (scripts, styles, navigation and forms are dropped), up to 200,000 characters.
+- **At most about 5k tokens of article per turn.** Articles up to about 20,000 characters go in word for word. Longer ones are read in full, split into parts of about 15k characters, and reduced to their claims, each with a word-for-word quote, then merged in order. The parts are summarised at most 2 at a time through the shared rate limiter.
+- **Quotes are checked in code.** Each piece of a quote between "…" must appear in the article word for word, or the quote is replaced with "[quote not found in the article]".
+- **The article is never taken as true.** The brief attributes its claims ("the article claims…"), states how much was read, and judges each key claim against your notes and papers as supported, contradicted or not covered.
+- **Logged** as `url_read` or `url_read_failed`, and counted as a `url_reader` tool call.
+
 ## Setup
 
 Developed on WSL2 (Ubuntu) with Python 3.14.
@@ -77,9 +99,12 @@ LOG_TO_GCP=true                          # optional, see Monitoring
 | `RERANK_CANDIDATES` | `15` | candidates from fused vector + keyword search that the reranker orders; the top 5 are returned |
 | `MAIN_MODEL`, `RESEARCHER_MODEL` | Gemini 3.8 Flash, 3.5 Flash Lite | `provider:model` (`google_genai:…` or `anthropic:…`); a bare name means Gemini |
 | `JUDGE_MODEL`, `VISION_MODEL` | `MAIN_MODEL`, `RESEARCHER_MODEL` | eval judge and question writer; image captions (any multimodal model) |
+| `WEB_SEARCH` | `true` | allow `/web` questions (Gemini Google Search, Gemini models only, strict guardrails) |
 | `CODE_SANDBOX` | `auto` | hosted Python for checks: `auto` uses `MAIN_MODEL`'s provider; `none` switches checks off |
 | `LLM_RPS` | `5` | maximum model calls per second per process (chat, UI), spaced evenly; `0` means no limit (`GEMINI_RPS` still works) |
 | `BATCH_RPS` | `1` | stricter pace that `ingest` and `evaluate` switch to, for long runs |
+| `SUMMARY_TRIGGER_TOKENS` | `30000` | follow-ups: once a conversation is this long, older turns are summarised; the latest brief and the last 3 turns stay word for word |
+| `LLM_TIMEOUT`, `FAST_LLM_TIMEOUT`, `SANDBOX_TIMEOUT` | `90`, `45`, `180` | seconds of silence on a model connection before the call is cut and retried (same model, 3 attempts in all). Answers that keep streaming are never cut; Google's own deadline for a whole request is 600 s |
 | `CHECKPOINT_DB` | `~/.ml_researcher/checkpoints.sqlite` | saved conversations |
 | `LOG_DIR` | `~/.ml_researcher/logs` | local JSON logs |
 | `LOG_LEVEL` | `INFO` | |
@@ -167,7 +192,7 @@ Indexing also writes an `ingest_file` event per file. To summarize the local log
 python -m ml_researcher.log_report --last 200    # p50 / p95 per metric and per step
 ```
 
-With `LOG_TO_GCP=true`, the same events go to Cloud Logging. To create the log-based metrics and the **"ML Researcher Agent"** dashboard (requests, errors, p50/p95 latency, TTFT, TPOT, step latency, input and output tokens per turn), run this once:
+With `LOG_TO_GCP=true`, the same events go to Cloud Logging. To create the log-based metrics and the **"ML Researcher Agent"** dashboard (requests, errors, p50/p95 latency, TTFT, TPOT, step latency, input and output tokens per turn, tool calls per research turn), run this once:
 
 ```bash
 python scripts/setup_gcp_metrics.py
@@ -319,6 +344,8 @@ ruff format --diff .  # preview formatting changes (ruff format . applies them)
 | Path | What it does |
 |---|---|
 | `ml_researcher/llm.py` | chat models: `chat_model("provider:model", effort)` for Gemini (Vertex AI) or Claude; one `effort` setting mapped to each provider |
+| `ml_researcher/urlreader.py` | `/read <url>`: fetch one user-given page or PDF as text (HTTPS, public addresses only, size caps) |
+| `ml_researcher/websearch.py` | `/web` search: Gemini Google Search as a source finder; domain allowlist, arXiv-API verification |
 | `ml_researcher/sandbox.py` | `CodeSandbox` interface for Python checks: Gemini or Claude **hosted** code execution, or none; code never runs locally |
 | `ml_researcher/cache.py` | prompt caching per provider: Gemini explicit caches (only above Vertex's 4,096-token minimum) or Claude `cache_control` breakpoints |
 | `ml_researcher/ratelimit.py` | one shared pace for all model calls (`LLM_RPS`); batch jobs drop to `BATCH_RPS` |
