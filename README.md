@@ -167,7 +167,7 @@ Indexing also writes an `ingest_file` event per file. To summarize the local log
 python -m ml_researcher.log_report --last 200    # p50 / p95 per metric and per step
 ```
 
-With `LOG_TO_GCP=true`, the same events go to Cloud Logging. To create the log-based metrics and the **"ML Researcher Agent"** dashboard (requests, errors, p50/p95 latency, TTFT, TPOT, step latency), run this once:
+With `LOG_TO_GCP=true`, the same events go to Cloud Logging. To create the log-based metrics and the **"ML Researcher Agent"** dashboard (requests, errors, p50/p95 latency, TTFT, TPOT, step latency, input and output tokens per turn), run this once:
 
 ```bash
 python scripts/setup_gcp_metrics.py

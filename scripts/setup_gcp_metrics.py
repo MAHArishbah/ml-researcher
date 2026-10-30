@@ -54,6 +54,8 @@ METRICS = [
                  {"linearBuckets": {"numFiniteBuckets": 50, "width": 1, "offset": 0}}, ["route"]),
     distribution("output_tokens", "Output tokens per turn (all LLM calls, incl. reasoning)", REQ,
                  "output_tokens", "1", exp_buckets(1, 1.3, 64), ["route"]),
+    distribution("input_tokens", "Input (prompt) tokens per turn, all LLM calls", REQ,
+                 "input_tokens", "1", exp_buckets(1, 1.3, 64), ["route"]),
     distribution("reply_tokens", "Visible reply tokens per turn", REQ, "reply_tokens", "1",
                  exp_buckets(1, 1.3, 64), ["route"]),
     counter("steps", "Graph node executions by node / status", STEP, ["node", "status"]),
@@ -98,6 +100,7 @@ def dashboard() -> dict:
                       ' AND metric.label.status!="ok"'), "plotType": "STACKED_BAR"}]}},
         p50_p95("Turn number p50 / p95", "turns", "turn"),
         p50_p95("Output tokens per turn p50 / p95", "output_tokens", "tokens"),
+        p50_p95("Input tokens per turn p50 / p95", "input_tokens", "tokens"),
         {"title": "Requests by route (per 5 min)", "xyChart": {"dataSets": [
             {**series("requests", "REDUCE_SUM", "${metric.labels.route}", ["metric.label.route"]),
              "plotType": "STACKED_BAR"}]}},
