@@ -76,6 +76,11 @@ def source_urls(result) -> list:
     return found
 
 
+def find_urls(text: str) -> list:
+    """Every bare http(s) URL in text: the one pattern filter_urls also uses, so extraction and filtering agree."""
+    return _BARE_URL.findall(text or "")
+
+
 def norm_url(url: str) -> str:
     """Compare links loosely: scheme, www., trailing slash, arXiv version and abs/pdf don't matter."""
     u = re.sub(r"^https?://(www\.)?", "", url.strip().rstrip(".,;:!?)")).lower().rstrip("/")

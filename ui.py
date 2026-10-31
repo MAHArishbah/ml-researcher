@@ -26,13 +26,14 @@ STEP_LABELS = {
     "notes_researcher": "Searched your notes",
     "github_researcher": "Searched GitHub",
     "youtube_researcher": "Searched YouTube",
+    "code_researcher": "Searched your code",
     "web_researcher": "Web search (only for /web questions)",
     "reviewer": "Reviewed findings for gaps",
     "followup": "Follow-up search or Python check",
     "synthesizer": "Wrote study brief",
     "answer": "Answered from conversation",
 }
-FINDINGS = [("arxiv_findings", "arXiv"), ("local_findings", "My notes"),
+FINDINGS = [("arxiv_findings", "arXiv"), ("local_findings", "My notes"), ("code_findings", "My code"),
             ("github_findings", "GitHub"), ("youtube_findings", "YouTube")]
 REDRAW_SECS = 0.1                            # re-render markdown at most 10x per second
 

@@ -44,7 +44,7 @@ def chat_model(spec: str, effort: str | None = None, timeout: float = LLM_TIMEOU
 
 def provider_of(llm) -> str:
     """Provider behind a chat model (also through .bind_tools / .with_structured_output wrappers)."""
-    llm = getattr(llm, "bound", llm)
+    llm = getattr(llm, "bound", llm) #returns langchain's runnablebinding having real model in .bound
     name = type(llm).__name__
     return {"ChatGoogleGenerativeAI": "google_genai", "ChatAnthropic": "anthropic"}.get(name, name)
 

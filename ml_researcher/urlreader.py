@@ -6,8 +6,11 @@ Guardrails:
   - only the URL the user typed (the model can never ask for a fetch, links on the page are never followed);
   - https only; the host (and every redirect hop, at most MAX_REDIRECTS) must resolve to public internet
     addresses: localhost, private, link-local and reserved ranges are refused (no access to this machine
-    or the local network);
-  - web pages (up to 10 MB) and PDFs (up to 15 MB) only; connect/read timeouts;
+    or the local network). The connection is made to the exact address that was checked (pinned), so a
+    DNS answer that changes between check and connect (DNS rebinding) can't redirect it; TLS still
+    verifies the certificate for the real hostname;
+  - web pages (up to 10 MB) and PDFs (up to 15 MB) only; per-read timeouts AND a total deadline, so a
+    server that drips bytes can't hold the turn open;
   - only text is kept (scripts, styles, navigation, forms dropped), capped at MAX_CHARS (then condensed to ~5k tokens in graph.py); the caller treats it
     as untrusted data (wrapped, scanned for injection phrases).
 """
@@ -15,11 +18,13 @@ import ipaddress
 import logging
 import re
 import socket
+import time
 from urllib.parse import urljoin, urlparse
 
+import certifi
 import lxml.html
 import pymupdf
-import requests
+import urllib3
 
 log = logging.getLogger("ml_researcher.urlreader")
 READ_CMD = re.compile(r"(?<!\S)/read(?!\S)", re.IGNORECASE)   # the /read command, anywhere in the message
@@ -27,7 +32,8 @@ URL = re.compile(r"https?://[^\s<>\"']+")
 MAX_BYTES = {"html": 10_000_000, "pdf": 15_000_000}    # pages embed images/scripts; only text is kept
 MAX_CHARS = 200_000                      # read long articles whole; graph.py condenses them to ~5k tokens
 MAX_REDIRECTS = 3
-TIMEOUT = (10, 20)                       # connect, read (s)
+TIMEOUT = urllib3.Timeout(connect=10, read=20)   # per connect / per read (s)
+TOTAL_SECONDS = 60                       # whole download, however slowly bytes arrive
 HEADERS = {"User-Agent": "ml-researcher/1.0 (personal study assistant; reads one page on request)"}
 HTML_TYPES = ("text/html", "application/xhtml+xml", "text/plain")
 DROP = "//script|//style|//noscript|//svg|//nav|//footer|//form|//iframe|//button|//aside"
@@ -49,8 +55,8 @@ def parse_read(message: str) -> tuple[str, str] | None:
     return url[0].rstrip(").,;"), re.sub(r"\s+", " ", question).strip()
 
 
-def _check_host(url: str) -> None:
-    """https + every address the host resolves to must be public."""
+def _check_host(url: str) -> str:
+    """https + every address the host resolves to must be public. Returns the address to connect to."""
     parts = urlparse(url)
     if parts.scheme != "https" or not parts.hostname:
         raise ReadError("only https:// links are allowed")
@@ -58,32 +64,58 @@ def _check_host(url: str) -> None:
         infos = socket.getaddrinfo(parts.hostname, parts.port or 443, proto=socket.IPPROTO_TCP)
     except socket.gaierror:
         raise ReadError(f"cannot resolve {parts.hostname}") from None
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
+    ips = [ipaddress.ip_address(info[4][0]) for info in infos]
+    for ip in ips:
         if not ip.is_global or ip.is_multicast:
             raise ReadError(f"{parts.hostname} points to a non-public address ({ip}); refused")
+    return str(sorted(ips, key=lambda ip: ip.version)[0])          # prefer IPv4
+
+
+def _get(url: str, ip: str):
+    """GET pinned to the checked address: TCP goes to `ip`, while SNI, the Host header and certificate
+    verification use the URL's hostname. No new DNS lookup happens, so DNS rebinding can't swap the target."""
+    parts = urlparse(url)
+    pool = urllib3.HTTPSConnectionPool(ip, port=parts.port or 443, server_hostname=parts.hostname,
+                                       assert_hostname=parts.hostname, cert_reqs="CERT_REQUIRED",
+                                       ca_certs=certifi.where(), timeout=TIMEOUT, retries=False)
+    path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    return pool.urlopen("GET", path, headers={**HEADERS, "Host": parts.netloc}, redirect=False,
+                        preload_content=False)
 
 
 def _download(url: str) -> tuple[str, bytes, str]:
-    """(final url, body, content type) following at most MAX_REDIRECTS hops, each one re-checked."""
+    """(final url, body, content type) following at most MAX_REDIRECTS hops, each one re-checked and pinned."""
+    deadline = time.monotonic() + TOTAL_SECONDS
     for _ in range(MAX_REDIRECTS + 1):
-        _check_host(url)
-        with requests.get(url, headers=HEADERS, timeout=TIMEOUT, stream=True, allow_redirects=False) as r:
-            if r.is_redirect:
+        try:
+            r = _get(url, _check_host(url))
+        except urllib3.exceptions.HTTPError as e:
+            raise ReadError(f"connection failed: {type(e).__name__}") from None
+        try:
+            if r.status in (301, 302, 303, 307, 308):
                 url = urljoin(url, r.headers.get("Location", ""))
                 continue
-            if r.status_code != 200:
-                raise ReadError(f"HTTP {r.status_code}")
+            if r.status != 200:
+                raise ReadError(f"HTTP {r.status}")
             ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
             if ctype not in HTML_TYPES and ctype != "application/pdf":
                 raise ReadError(f"unsupported content type {ctype or 'unknown'}")
             limit = MAX_BYTES["pdf" if ctype == "application/pdf" else "html"]
-            body = b""
-            for part in r.iter_content(64_000):
-                body += part
-                if len(body) > limit:
-                    raise ReadError(f"larger than {limit // 1_000_000} MB")
-            return url, body, ctype
+            if int(r.headers.get("Content-Length") or 0) > limit:           # refuse before downloading
+                raise ReadError(f"larger than {limit // 1_000_000} MB")
+            body = bytearray()
+            try:
+                for part in r.stream(64_000):
+                    body += part
+                    if len(body) > limit:
+                        raise ReadError(f"larger than {limit // 1_000_000} MB")
+                    if time.monotonic() > deadline:
+                        raise ReadError(f"download took longer than {TOTAL_SECONDS} s")
+            except urllib3.exceptions.HTTPError as e:
+                raise ReadError(f"download failed: {type(e).__name__}") from None
+            return url, bytes(body), ctype
+        finally:
+            r.release_conn()
     raise ReadError(f"more than {MAX_REDIRECTS} redirects")
 
 
@@ -92,7 +124,9 @@ def _html_text(body: bytes) -> tuple[str, str]:
     for el in doc.xpath(DROP):
         el.drop_tree()
     title = (doc.findtext(".//title") or "").strip()
-    blocks = [re.sub(r"\s+", " ", el.text_content()).strip() for el in doc.iter(*BLOCKS)]
+    # outermost blocks only: a <p> inside an <li> or <td> is already part of that block's text
+    blocks = [re.sub(r"\s+", " ", el.text_content()).strip() for el in doc.iter(*BLOCKS)
+              if not any(a.tag in BLOCKS for a in el.iterancestors())]
     text = "\n\n".join(b for b in blocks if len(b) > 1)
     if len(text) < 200:                          # unusual markup: fall back to all visible text
         text = re.sub(r"\n\s*\n+", "\n\n", doc.text_content())

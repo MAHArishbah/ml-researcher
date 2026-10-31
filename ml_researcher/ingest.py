@@ -4,6 +4,7 @@ discover -> plan -> index_file (one Send per new/changed file, parallel) -> clea
 Run from /mnt/e/AI_ML/Prac/researchAgent:
     python -m ml_researcher.ingest /mnt/e/AI_ML/Books "E:\\AI_ML\\Notes"
     python -m ml_researcher.ingest            # no argument -> LOCAL_DOCS_DIR from .env
+    python -m ml_researcher.ingest --code     # your code -> the separate code index (CODE_DIRS from .env)
 """
 import argparse
 import operator
@@ -18,12 +19,13 @@ from tqdm import tqdm
 import time
 import logging
 
-from . import ratelimit, vectordb
-from .config import DOCS_DIR, FILE_WORKERS, VECTOR_BACKEND
+from . import codeindex, ratelimit, vectordb
+from .config import CODE_DIRS, DOCS_DIR, FILE_WORKERS, VECTOR_BACKEND
 from .readers import to_wsl_path, walk
 from .logging_config import setup_logging
 
 log = logging.getLogger("ml_researcher.ingest")
+STORE, WALK = vectordb, walk          # notes index by default; main() switches both for --code
 
 
 class IngestState(TypedDict,total=False):
@@ -42,7 +44,7 @@ class FileTask(TypedDict):                        # payload of each Send
 def discover(state: IngestState) -> dict:
     files = []
     for root in state["roots"]:
-        for p in walk(Path(root)):
+        for p in WALK(Path(root)):
             try:
                 files.append({"path": str(p), "mtime": p.stat().st_mtime})
             except OSError:
@@ -50,7 +52,7 @@ def discover(state: IngestState) -> dict:
     return {"files": files}
 
 def plan(state: IngestState) -> dict:
-    known = vectordb.indexed_files()
+    known = STORE.indexed_files()
     todo = [f for f in state["files"] if known.get(f["path"]) != f["mtime"]]
     todo.sort(key=lambda f: os.path.getsize(f["path"])) #index the shorter files first
     on_disk = {f["path"] for f in state["files"]}
@@ -67,7 +69,7 @@ def index_file(task: FileTask) -> dict:
     name, t0 = Path(task["path"]).name, time.monotonic()
     tqdm.write(f"  -> {name}")
     try:
-        n = vectordb.upsert_file(Path(task["path"]), task["mtime"])
+        n = STORE.upsert_file(Path(task["path"]), task["mtime"])
         res = {"path": task["path"], "status": "ok" if n else "empty", "chunks": n}
     except Exception as e:
         res = {"path": task["path"], "status": "failed", "error": str(e)[:200]}
@@ -77,7 +79,7 @@ def index_file(task: FileTask) -> dict:
 
 def cleanup(state: IngestState) -> dict:
     gone = state.get("gone", [])
-    vectordb.delete_paths(gone)
+    STORE.delete_paths(gone)
     return {"removed": len(gone)}
 
 def build_ingest_graph():
@@ -98,10 +100,14 @@ def main():
     ratelimit.batch_mode()                       # long jobs: steady, low request rate
     ap = argparse.ArgumentParser(description="Recursively index PDF/Word/Markdown files.")
     ap.add_argument("folders", nargs="*", help="folders to index (Linux or Windows paths)")
+    ap.add_argument("--code", action="store_true", help="index code into the separate code index")
     args = ap.parse_args()
 
     roots = []
-    for raw in args.folders or [str(DOCS_DIR)]:
+    global STORE, WALK
+    if args.code:
+        STORE, WALK = codeindex, codeindex.walk
+    for raw in args.folders or [str(d) for d in (CODE_DIRS if args.code else [DOCS_DIR])]:
         r = to_wsl_path(raw)
         if r.is_dir():
             roots.append(str(r))
@@ -134,6 +140,6 @@ def main():
 
     s = Counter(r["status"] for r in results)
     print(f"done: ok {s['ok']}, no text {s['empty']}, failed {s['failed']} | "
-          f"items in DB: {vectordb.count()}")
+          f"items in {'code' if STORE is codeindex else 'notes'} index: {STORE.count()}")
 if __name__ == "__main__":
     main()

@@ -20,6 +20,7 @@ Models are provider-agnostic: only the LangChain chat-model interface is used he
 import json
 import logging
 import re
+import unicodedata
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Literal
@@ -33,16 +34,16 @@ from typing_extensions import TypedDict
 
 from . import cache, urlreader, websearch
 from .config import MAIN_MODEL, SUMMARY_TRIGGER_TOKENS
-from .guards import action_key, call_key, digest, filter_urls, is_empty, outcome, source_urls, suspicious
+from .guards import (action_key, call_key, digest, filter_urls, find_urls, is_empty, outcome, source_urls,
+                     suspicious)
 from .llm import FAST_LLM, MAIN_LLM, RESEARCH_LLM, chat_model, structured, text_of
 from .sandbox import get_sandbox
-from .tools import arxiv_search, github_search, search_local_notes, youtube_search
+from .tools import arxiv_search, github_search, search_local_notes, search_my_code, youtube_search
 
 log = logging.getLogger("ml_researcher.graph")
 # low effort like FAST_LLM, but the 90 s silence limit: summarising an article part or a long conversation is
 # one non-streamed call whose reply only arrives when it is complete. Shares the rate limiter like every model.
 LONG_LLM = chat_model(MAIN_MODEL, effort="low")
-_URL = re.compile(r"https?://[^\s<>\"'()\[\]]+")       # links already present in the conversation
 
 MAX_TOOL_CALLS = 3               # per researcher run: the suggested query + up to 2 refinements
 MAX_REPEATS = 2                  # repeated calls/results before the researcher must stop searching
@@ -79,6 +80,7 @@ class ResearchState(TypedDict, total=False):
     local_findings: str
     github_findings: str
     youtube_findings: str
+    code_findings: str                        # the user's own code (code index)
     result_keys: Annotated[list, _turn_list]  # hashes of non-empty raw tool results seen this turn
     allowed_urls: Annotated[list, _turn_list] # URLs tools returned this turn: the only links a brief may contain
     tool_calls: Annotated[list, _turn_list]   # name of every tool actually run this turn (searches, python, web)
@@ -109,10 +111,11 @@ class SearchPlan(BaseModel):
     local: str = Field(description="concept description for searching personal notes; keep exact jargon and acronyms")
     github: str = Field(description="GitHub repository query; add language:python and stars:>20 when sensible")
     youtube: str = Field(description="keywords for lecture or explainer videos")
+    code: str = Field(description="what the user's own code would contain for this topic: function names, libraries and ML terms")
 
 
 class FollowUp(BaseModel):
-    source: Literal["notes", "arxiv", "github", "youtube", "python"]
+    source: Literal["notes", "code", "arxiv", "github", "youtube", "python"]
     query: str = Field(description="a new search query; for python: exactly what to compute or verify")
     reason: str = Field(description="the gap this fills")
 
@@ -189,14 +192,23 @@ def _parts(text: str, size: int) -> list:
     return parts + ([buf] if buf else [])
 
 
-_QUOTE = re.compile(r"\"([^\"\n]{12,})\"")                 # a quote never spans lines
+_QUOTE = re.compile(r"[\"\u201c]([^\"\u201c\u201d\n]{12,})[\"\u201d]")   # straight or curly; never spans lines
+_ZERO_WIDTH = re.compile("[\u200b\u200c\u200d\u2060\ufeff]")
+_PLAIN = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-", "\u2014": "-"})
+
+
+def _norm_quote(text: str) -> str:
+    """Compare quotes on content: Unicode forms, zero-width characters, curly quotes, dashes, case and spacing
+    don't matter."""
+    text = _ZERO_WIDTH.sub("", unicodedata.normalize("NFKC", text)).translate(_PLAIN)
+    return re.sub(r"\s+", " ", text).strip().lower()
 
 
 def _verify_quotes(context: str, article: str) -> tuple[str, int, int]:
     """Every quote must really be in the article: each piece between '...' must appear word for word
     (case and spacing aside). A quote that fails is replaced, so a claim never carries invented evidence.
     Returns (context, quotes checked, quotes replaced)."""
-    norm = lambda s: re.sub(r"\s+", " ", s).strip().lower()  # noqa: E731
+    norm = _norm_quote
     source, checked, failed = norm(article), 0, 0
 
     def check(m):
@@ -217,7 +229,9 @@ def _condense(text: str) -> tuple[str, int]:
     Every call goes through chat_model, i.e. the shared rate limiter; at most 2 run at a time."""
     if len(text) <= ARTICLE_CHARS:
         return text, 0
-    parts = _parts(text, ARTICLE_PART_CHARS)[:ARTICLE_MAX_PARTS]
+    parts = _parts(text, ARTICLE_PART_CHARS)
+    while len(parts) > ARTICLE_MAX_PARTS:          # loosely packed (long paragraphs): merge neighbours, drop nothing
+        parts = ["\n\n".join(parts[i:i + 2]) for i in range(0, len(parts), 2)]
     with ThreadPoolExecutor(2) as ex:
         claims = list(ex.map(lambda p: text_of(LONG_LLM.invoke(
             [SystemMessage(PART_PROMPT), HumanMessage(f"<article>\n{p}\n</article>")])), parts))
@@ -239,10 +253,22 @@ def _read_page(url: str) -> dict:
             "event": "url_read_failed", "url": url, "error": str(e)[:200]}})
         return {"page_url": "", "page_findings": f"(could not read {url}: {e})", "ideas": ""}
     _flag("shared article", page["text"])
-    context, n_parts = _condense(page["text"])
-    ideas = text_of(LONG_LLM.invoke([SystemMessage(ARTICLE_PROMPT), HumanMessage(f"<article>\n{context}\n</article>")]))
-    coverage = (f"the whole article, verbatim ({page['chars']:,} characters)" if not n_parts else
-                f"the article's claims with quotes, condensed from {n_parts} parts ({page['chars']:,} characters)")
+    try:
+        context, n_parts = _condense(page["text"])
+        coverage = (f"the whole article, verbatim ({page['chars']:,} characters)" if not n_parts else
+                    f"the article's claims with quotes, condensed from {n_parts} parts ({page['chars']:,} characters)")
+    except Exception as e:                                     # a part/merge call failed after its retries
+        log.warning("could not condense %s: %s", url, e, extra={"json_fields": {
+            "event": "article_condense_failed", "url": page["url"], "error": str(e)[:200]}})
+        context, n_parts = page["text"][:ARTICLE_CHARS], 0
+        coverage = (f"condensing failed ({type(e).__name__}); ONLY THE FIRST {len(context):,} of "
+                    f"{page['chars']:,} CHARACTERS are included, the rest is missing")
+    try:
+        ideas = text_of(LONG_LLM.invoke([SystemMessage(ARTICLE_PROMPT),
+                                         HumanMessage(f"<article>\n{context}\n</article>")]))
+    except Exception as e:                                     # planner then searches from the topic alone
+        log.warning("could not extract key ideas: %s", e)
+        ideas = ""
     if page["truncated"]:
         coverage += f"; ONLY THE FIRST {urlreader.MAX_CHARS:,} CHARACTERS were read, the rest is missing"
     log.info("article condensed", extra={"json_fields": {"event": "article_context", "url": page["url"],
@@ -388,7 +414,11 @@ GITHUB = make_researcher(github_search, "GitHub code",
     "Report 3-5 repos: name, URL, stars, and what a learner should read in it.")
 YOUTUBE = make_researcher(youtube_search, "YouTube videos",
     "Report 3-5 videos: title, channel, URL, and what each explains.")
+CODE = make_researcher(search_my_code, "the user's own code",
+    "Report the most relevant code: file path, symbol and line, and 1-2 lines on what it does and how it "
+    "relates to the topic. Quote at most a few lines, only from the results. If nothing relevant is found, say so.")
 SOURCES = {"arxiv": (ARXIV, "arxiv", "arxiv_findings"), "notes": (NOTES, "local", "local_findings"),
+           "code": (CODE, "code", "code_findings"),
            "github": (GITHUB, "github", "github_findings"), "youtube": (YOUTUBE, "youtube", "youtube_findings")}
 
 
@@ -491,11 +521,11 @@ def _stop_reason(state: ResearchState, rnd: int, log: list) -> str:
 
 
 def _first_pass(state: ResearchState) -> str:
-    """The 4 researchers' findings: fixed for the rest of the turn, so it is the cached prefix."""
+    """The 5 researchers' findings: fixed for the rest of the turn, so it is the cached prefix."""
     parts = [f"TOPIC: {state['topic']}"]
     parts += [f"{label}:\n<findings>\n{(state.get(key) or '')[:FINDINGS_LIMIT]}\n</findings>" for label, key in
-              (("PAPERS", "arxiv_findings"), ("MY NOTES", "local_findings"),
-               ("CODE", "github_findings"), ("VIDEOS", "youtube_findings"))]
+              (("PAPERS", "arxiv_findings"), ("MY NOTES", "local_findings"), ("MY CODE", "code_findings"),
+               ("GITHUB REPOS", "github_findings"), ("VIDEOS", "youtube_findings"))]
     if state.get("page_findings"):                   # only on /read turns
         parts.insert(1, f"SHARED ARTICLE:\n<findings>\n{state['page_findings']}\n</findings>")
     if state.get("web_findings"):                    # only on /web turns
@@ -528,21 +558,26 @@ def _research_call(state: ResearchState, llm, task: str, schema=None):
 
 
 def reviewer(state: ResearchState) -> dict:
-    rnd, log = state.get("review_round", 0), state.get("followups") or []
-    if reason := _stop_reason(state, rnd, log):
+    rnd, done_log = state.get("review_round", 0), state.get("followups") or []
+    if reason := _stop_reason(state, rnd, done_log):
         return {"pending": [], "review_note": reason}
     plan = state["search_plan"]
     already = [f"- [{src}] {plan[k]}" for src, (_, k, _) in SOURCES.items() if plan.get(k)]
-    already += [f"- [{e['source']}] {e['query']}" for e in log]
-    used = Counter(e["source"] for e in log)
+    already += [f"- [{e['source']}] {e['query']}" for e in done_log]
+    used = Counter(e["source"] for e in done_log)
     sources = (*SOURCES, "python") if SANDBOX else tuple(SOURCES)
     budget = ", ".join(f"{s} {MAX_FOLLOWUPS_PER_SOURCE - used[s]}" for s in sources)
-    review, _ = _research_call(state, FAST_LLM, f"{REVIEW_PROMPT}\n\nALREADY DONE:\n" + "\n".join(already)
-                               + f"\n\nFollow-ups left per source: {budget}. Round {rnd + 1} of {MAX_REVIEW_ROUNDS}.",
-                               schema=Review)
+    try:      # LONG_LLM: same model and effort as FAST_LLM, 90 s limit (one non-streamed call over all findings)
+        review, _ = _research_call(state, LONG_LLM, f"{REVIEW_PROMPT}\n\nALREADY DONE:\n" + "\n".join(already)
+                                   + f"\n\nFollow-ups left per source: {budget}. Round {rnd + 1} of {MAX_REVIEW_ROUNDS}.",
+                                   schema=Review)
+    except Exception as e:    # the review is optional: write the brief from what we have instead of failing the turn
+        log.warning("review skipped: %s", e, extra={"json_fields": {
+            "event": "review_skipped", "round": rnd + 1, "error": f"{type(e).__name__}: {str(e)[:200]}"}})
+        return {"pending": [], "review_note": f"stopped: review failed ({type(e).__name__}), brief written from findings"}
     if review is None or review.done or not review.followups:
         return {"pending": [], "review_note": f"done: {review.reason if review else 'no review'}"}
-    approved, note = approve_followups(review.followups, plan, log, rnd + 1)
+    approved, note = approve_followups(review.followups, plan, done_log, rnd + 1)
     if not approved:
         return {"pending": [], "review_note": f"stopped: nothing new to do ({note})"}
     return {"pending": approved, "review_round": rnd + 1, "review_note": note}
@@ -570,12 +605,15 @@ Use ONLY the findings provided. Never invent papers, links, repos or videos; cop
 Use exactly these markdown headings, in this order:
 ## Core idea
 ## What my notes cover
+## My code
 ## Papers
 ## Repos
 ## Videos
 ## Self-test
 Core idea builds from prerequisites upward in 15-20 sentences. What my notes cover says what the
-user's notes already explain and what is missing. Papers gives a reading order with one reason
+user's notes already explain and what is missing. My code points to where the user's own projects
+implement or use the idea (file :: symbol, line) and how that compares with the papers; if nothing relevant
+was found, say so in one line. Papers gives a reading order with one reason
 each. Repos says what to look at in each. Videos goes shortest path first. Self-test has three questions.
 FOLLOW-UP entries are targeted extra searches: merge them into the matching sections. If any FOLLOW-UP is a
 python check, add a final '## Checks' section with what was computed and the result, and point out in
@@ -664,7 +702,7 @@ def answer(state: ResearchState) -> dict:
     prefix, tail = messages[:cut + 1], messages[cut + 1:]
     reply = cache.invoke(MAIN_LLM, system, prefix, tail, cache.key_for("chat", system, prefix), CHAT_CACHE_TTL)
     # follow-up answers may only reuse links already in the conversation (briefs were filtered when written)
-    seen = [u for m in [SystemMessage(system), *prefix, *tail] for u in _URL.findall(text_of(m))]
+    seen = [u for m in state["messages"] for u in find_urls(text_of(m))]   # not the summary: model-written
     return {"messages": [AIMessage(content=_only_known_links(text_of(reply), seen, "answer"))], **update}
 
 

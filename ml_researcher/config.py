@@ -18,6 +18,8 @@ RESEARCHER_MODEL = _spec(os.getenv("RESEARCHER_MODEL") or MAIN_MODEL)     # revi
 JUDGE_MODEL = _spec(os.getenv("JUDGE_MODEL") or MAIN_MODEL)               # evaluate: golden-set writer + DeepEval judge
 VISION_MODEL = _spec(os.getenv("VISION_MODEL") or RESEARCHER_MODEL)       # image captions during ingest
 WEB_SEARCH = os.getenv("WEB_SEARCH", "true").lower() == "true"          # allow /web questions (Gemini grounding)
+CODE_DIRS = [Path(os.path.expanduser(p.strip())) for p in os.getenv("CODE_DIRS", "/mnt/e/AI_ML/Prac").split(",")
+             if p.strip()]                                            # your code, indexed with ingest --code
 CODE_SANDBOX = os.getenv("CODE_SANDBOX", "auto").lower()                  # auto (MAIN_MODEL's provider) | google_genai
                                                                           # | anthropic | none
 

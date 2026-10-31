@@ -11,6 +11,7 @@ Search grounding, but treats it purely as a source finder:
 """
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import arxiv
@@ -66,8 +67,10 @@ def search(topic: str) -> tuple[str, list, dict]:
     meta = reply.response_metadata.get("grounding_metadata") or {}
     chunks = [c["web"] for c in meta.get("grounding_chunks") or [] if c.get("web")]
     arxiv_ids, links, dropped = [], [], []
-    for web in chunks[: WEB_MAX_SOURCES * 2]:
-        target = _resolve(web.get("uri", ""))
+    candidates = chunks[: WEB_MAX_SOURCES * 2]
+    with ThreadPoolExecutor(4) as ex:        # plain redirect lookups (not model calls), independent of each other
+        targets = list(ex.map(lambda w: _resolve(w.get("uri", "")), candidates))
+    for web, target in zip(candidates, targets, strict=True):
         if not target:
             dropped.append(web.get("domain") or "unresolved")
         elif (m := ARXIV_ID.search(target)) and _allowed(target, {"arxiv.org"}):

@@ -40,4 +40,13 @@ else
     echo "=== FAILED (exit $?) after $(( (SECONDS - start) / 60 )) min"
 fi
 
+# your code -> the separate code index (CODE_DIRS from .env); only changed files are re-embedded
+start=$SECONDS
+echo "=== code index"
+if "$PYTHON" -m ml_researcher.ingest --code; then
+    echo "=== code finished in $(( (SECONDS - start) / 60 )) min"
+else
+    echo "=== code FAILED (exit $?) after $(( (SECONDS - start) / 60 )) min"
+fi
+
 find "$LOG_DIR" -name 'ingest-*.log' -mtime +"$KEEP_DAYS" -delete

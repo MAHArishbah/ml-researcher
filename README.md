@@ -1,19 +1,20 @@
 # ML Researcher
 
-A personal research agent for machine-learning topics. You ask a question, and it searches **arXiv, your own notes, GitHub and YouTube** in parallel. It then writes a study brief with math rendered as LaTeX. Follow-up questions are answered from the conversation, without searching again.
+A personal research agent for machine-learning topics. You ask a question, and it searches **arXiv, your own notes, your own code, GitHub and YouTube** in parallel. It then writes a study brief with math rendered as LaTeX. Follow-up questions are answered from the conversation, without searching again.
 
 It's built on LangGraph with Gemini (through Vertex AI). Your notes (PDF, Word, PowerPoint, Markdown) are indexed into a local Chroma database, and figures and diagrams are captioned by Gemini so they can be searched too.
 
 ```
                     ┌─> arxiv_researcher   ─┐
-router ─> planner ──┼─> notes_researcher   ─┼─> reviewer ─> synthesizer ─> study brief
+                    ├─> notes_researcher   ─┤
+router ─> planner ──┼─> code_researcher    ─┼─> reviewer ─> synthesizer ─> study brief
    │                ├─> github_researcher  ─┤     │  ▲
    │                └─> youtube_researcher ─┘     ▼  │
    │                               follow-ups: search a source again, or a Python check
    └─> answer  (follow-ups: answered from the conversation, no search)
 ```
 
-After the first pass, a **reviewer** looks for gaps. For example, a video might use a term your notes weren't searched for, or a formula could be checked. It can then send follow-ups back to any source, or ask for a **Python check**. The brief gets a `## Checks` section when one runs.
+After the first pass, a **reviewer** looks for gaps. For example, a video might use a term your notes weren't searched for, or a formula could be checked. It can then send follow-ups back to any source, or ask for a **Python check**. The brief gets a `## Checks` section when one runs. The review is optional: if its call fails (for example while Google is overloaded), the brief is written from the researchers' findings and `review_skipped` is logged, instead of the turn failing.
 
 **Loop guards** (constants at the top of `graph.py`):
 - **Inside each researcher:**
@@ -36,7 +37,7 @@ After the first pass, a **reviewer** looks for gaps. For example, a video might 
 - **Suspicious phrases are flagged.** Phrases like "ignore previous instructions" in tool or Python output are logged as `injection_suspect`, and a warning is attached for the model.
 - **Other limits:** secrets never enter prompts, Python runs only in the provider's sandbox, the UI never renders raw HTML, and code enforces the loop and follow-up limits whatever a model asks for.
 
-**Web search for new papers (`/web`).** Put `/web` anywhere in a question (for example `/web latest papers on flow matching`) to add a Gemini Google Search pass beside the four researchers. It is off for every other question, and `WEB_SEARCH=false` switches it off entirely. Guardrails:
+**Web search for new papers (`/web`).** Put `/web` anywhere in a question (for example `/web latest papers on flow matching`) to add a Gemini Google Search pass beside the other researchers. It is off for every other question, and `WEB_SEARCH=false` switches it off entirely. Guardrails:
 - **Gemini's written answer is discarded;** only its list of sources is used.
 - **Each source's real address** is read from Google's redirect without opening the page, and kept only if it's HTTPS on an allowlisted domain. Everything else is dropped.
 - **arXiv papers are re-fetched from the arXiv API,** so the title, authors, date and abstract come from arXiv, not the web page. Other allowed sites (OpenReview, GitHub, Hugging Face, NeurIPS/PMLR/ACL/CVF/JMLR proceedings) are passed as links only.
@@ -44,8 +45,8 @@ After the first pass, a **reviewer** looks for gaps. For example, a video might 
 
 **Read an article (`/read`).** Put `/read` and a link anywhere in the message, in any order (`/web` can be added too), for example `/read https://example.com/post how does this relate to my notes on superposition?`, reads that one page (a web page or PDF). The planner searches your notes for what the article discusses, and the brief starts with `## What the article says` and compares your notes with it (what they confirm, add or contradict). Guardrails (`urlreader.py`):
 - **Only the URL you typed is fetched.** The model can never request a fetch, and links on the page are never followed.
-- **HTTPS only.** The host and every redirect (at most 3) must resolve to public addresses, so localhost, your local network and cloud-metadata addresses are refused.
-- **Web pages (up to 10 MB) and PDFs (up to 15 MB) only,** with timeouts. Only text is kept (scripts, styles, navigation and forms are dropped), up to 200,000 characters.
+- **HTTPS only.** The host and every redirect (at most 3) must resolve to public addresses, so localhost, your local network and cloud-metadata addresses are refused. The connection is **pinned to the checked address** (TLS still verifies the hostname), so a DNS answer that changes after the check (DNS rebinding) can't redirect it.
+- **Web pages (up to 10 MB) and PDFs (up to 15 MB) only,** with a 20 s per-read limit and a 60 s limit for the whole download. Only text is kept (scripts, styles, navigation and forms are dropped), up to 200,000 characters.
 - **At most about 5k tokens of article per turn.** Articles up to about 20,000 characters go in word for word. Longer ones are read in full, split into parts of about 15k characters, and reduced to their claims, each with a word-for-word quote, then merged in order. The parts are summarised at most 2 at a time through the shared rate limiter.
 - **Quotes are checked in code.** Each piece of a quote between "…" must appear in the article word for word, or the quote is replaced with "[quote not found in the article]".
 - **The article is never taken as true.** The brief attributes its claims ("the article claims…"), states how much was read, and judges each key claim against your notes and papers as supported, contradicted or not covered.
@@ -72,7 +73,7 @@ GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_GENAI_USE_VERTEXAI=TRUE
 GOOGLE_CLOUD_LOCATION=global
 MAIN_MODEL=google_genai:gemini-3.8-flash          # router, planner, reviewer, synthesizer, answers
-RESEARCHER_MODEL=google_genai:gemini-3.5-flash-lite   # the 4 researchers + image captions
+RESEARCHER_MODEL=google_genai:gemini-3.5-flash-lite   # the 5 researchers + image captions
 # Claude instead: MAIN_MODEL=anthropic:claude-sonnet-5-5 and ANTHROPIC_API_KEY=...  (embeddings stay on Gemini)
 EMBED_MODEL=gemini-embedding-2
 EMBED_DIM=768
@@ -99,9 +100,10 @@ LOG_TO_GCP=true                          # optional, see Monitoring
 | `RERANK_CANDIDATES` | `15` | candidates from fused vector + keyword search that the reranker orders; the top 5 are returned |
 | `MAIN_MODEL`, `RESEARCHER_MODEL` | Gemini 3.8 Flash, 3.5 Flash Lite | `provider:model` (`google_genai:…` or `anthropic:…`); a bare name means Gemini |
 | `JUDGE_MODEL`, `VISION_MODEL` | `MAIN_MODEL`, `RESEARCHER_MODEL` | eval judge and question writer; image captions (any multimodal model) |
+| `CODE_DIRS` | `/mnt/e/AI_ML/Prac` | folders of your own code for the code index (comma-separated) |
 | `WEB_SEARCH` | `true` | allow `/web` questions (Gemini Google Search, Gemini models only, strict guardrails) |
 | `CODE_SANDBOX` | `auto` | hosted Python for checks: `auto` uses `MAIN_MODEL`'s provider; `none` switches checks off |
-| `LLM_RPS` | `5` | maximum model calls per second per process (chat, UI), spaced evenly; `0` means no limit (`GEMINI_RPS` still works) |
+| `LLM_RPS` | `5` | maximum model calls per second, spaced evenly: per process (chat, UI) **and combined across all processes** (UI + daily ingest + eval), coordinated through `~/.ml_researcher/pacer.slot`; `0` means no limit (`GEMINI_RPS` still works) |
 | `BATCH_RPS` | `1` | stricter pace that `ingest` and `evaluate` switch to, for long runs |
 | `SUMMARY_TRIGGER_TOKENS` | `30000` | follow-ups: once a conversation is this long, older turns are summarised; the latest brief and the last 3 turns stay word for word |
 | `LLM_TIMEOUT`, `FAST_LLM_TIMEOUT`, `SANDBOX_TIMEOUT` | `90`, `45`, `180` | seconds of silence on a model connection before the call is cut and retried (same model, 3 attempts in all). Answers that keep streaming are never cut; Google's own deadline for a whole request is 600 s |
@@ -157,6 +159,22 @@ Register-ScheduledTask -TaskName "ML Researcher daily ingest" -Action $a -Trigge
 ```
 
 `-StartWhenAvailable` runs a missed day as soon as you log in. Run it now with `Start-ScheduledTask "ML Researcher daily ingest"`, and remove it with `Unregister-ScheduledTask "ML Researcher daily ingest"`.
+
+### Index your code
+
+Your own projects get a **separate index** (a second Chroma collection, `ml_code_…`, with its own keyword index), so code and notes never compete for the same top-5 results:
+
+```bash
+python -m ml_researcher.ingest --code            # CODE_DIRS from .env (default /mnt/e/AI_ML/Prac)
+python -m ml_researcher.ingest --code "/mnt/e/AI_ML/Prac/SCI"     # or specific folders
+```
+
+- **Split by code structure:** Python by function and class (large classes by method), notebooks by groups of cells with outputs trimmed, other files (`.md`, `.ts`, `.yaml` …) by blank-line blocks. Every chunk starts with `# <path> :: <symbol> (line N)`.
+- **Secrets never leave your machine:** `.env*`, keys, certificates and credential files are skipped, and before a chunk is embedded, values that look like API keys, tokens, private keys or passwords are replaced by `<redacted>` (logged as `code_redacted`). Normal code such as `pad_token = "<eos>"` is left alone.
+- **Skipped folders:** virtual environments, `site-packages`, `node_modules`, `.git` and caches.
+- **Incremental, like notes:** the daily re-index updates the code index too. About 280 files become about 1,700 chunks, roughly 30 minutes the first time.
+
+A fifth researcher searches it (`search_my_code`), and briefs gain a `## My code` section: where your projects implement the idea (file :: symbol, line) and how that compares with the papers.
 
 ## 2. Chat
 
@@ -345,10 +363,11 @@ ruff format --diff .  # preview formatting changes (ruff format . applies them)
 |---|---|
 | `ml_researcher/llm.py` | chat models: `chat_model("provider:model", effort)` for Gemini (Vertex AI) or Claude; one `effort` setting mapped to each provider |
 | `ml_researcher/urlreader.py` | `/read <url>`: fetch one user-given page or PDF as text (HTTPS, public addresses only, size caps) |
+| `ml_researcher/codeindex.py` | your code as a separate index: structure-aware chunks, secret-file skipping and redaction |
 | `ml_researcher/websearch.py` | `/web` search: Gemini Google Search as a source finder; domain allowlist, arXiv-API verification |
 | `ml_researcher/sandbox.py` | `CodeSandbox` interface for Python checks: Gemini or Claude **hosted** code execution, or none; code never runs locally |
 | `ml_researcher/cache.py` | prompt caching per provider: Gemini explicit caches (only above Vertex's 4,096-token minimum) or Claude `cache_control` breakpoints |
-| `ml_researcher/ratelimit.py` | one shared pace for all model calls (`LLM_RPS`); batch jobs drop to `BATCH_RPS` |
+| `ml_researcher/ratelimit.py` | pacing for every model call: each process's own pace (`LLM_RPS`, or `BATCH_RPS` for batch jobs) plus one combined limit across all processes (a file-locked shared timeline) |
 | `ml_researcher/config.py` | all settings, read from `.env` |
 
 **Notes search and ingestion**

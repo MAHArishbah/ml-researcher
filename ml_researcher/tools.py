@@ -3,7 +3,7 @@ import requests
 from googleapiclient.discovery import build
 import html
 
-from . import vectordb
+from . import codeindex, vectordb
 from .config import GITHUB_TOKEN,YOUTUBE_API_KEY
 
 def arxiv_search(query:str,max_results: int =5) ->dict:
@@ -39,6 +39,23 @@ def search_local_notes(query: str, top_k: int = 5, file_type: str = "") -> dict:
             return {"status": "error",
                     "message": "Notes index is empty. Run: python -m ml_researcher.ingest <folder>"}
         return {"status": "ok", "hits": vectordb.search(query, min(top_k, 10), file_type)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+def search_my_code(query: str, top_k: int = 5, language: str = "") -> dict:
+    """Search the user's own code (their projects: Python files, notebooks, scripts, configs).
+    Each hit is a whole function, class or group of notebook cells, with its file path, symbol and line.
+
+    Args:
+        query: what the code does or implements; use names of functions, libraries and ML terms.
+        top_k: number of code chunks to return (1-10).
+        language: optional file extension filter, e.g. 'py', 'ipynb', 'ts', 'md'. Empty = all code.
+    """
+    try:
+        if codeindex.count() == 0:
+            return {"status": "error",
+                    "message": "Code index is empty. Run: python -m ml_researcher.ingest --code"}
+        return {"status": "ok", "hits": codeindex.search(query, min(top_k, 10), language)}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
