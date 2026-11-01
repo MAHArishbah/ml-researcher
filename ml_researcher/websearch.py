@@ -19,14 +19,14 @@ import requests
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .config import MAIN_MODEL, WEB_SEARCH
+from .prompts import prompt
 
 log = logging.getLogger("ml_researcher.websearch")
 WEB_MAX_SOURCES = 8
 ARXIV_ID = re.compile(r"arxiv\.org/(?:abs|pdf|html)/(\d{4}\.\d{4,5})(?:v\d+)?")
 LINK_ONLY_DOMAINS = {"openreview.net", "github.com", "huggingface.co", "proceedings.neurips.cc",
                      "proceedings.mlr.press", "aclanthology.org", "openaccess.thecvf.com", "jmlr.org"}
-SEARCH_PROMPT = ("Find recent machine-learning research papers on the user's topic, preferring arXiv. "
-                 "Search the web; a short list of titles is enough.")
+SEARCH_PROMPT = prompt("WEB_SEARCH")
 _llm = None
 
 

@@ -4,6 +4,7 @@ from PIL import Image
 from langchain_core.messages import HumanMessage
 from .config import VISION_MODEL
 from .llm import text_of
+from .prompts import prompt
 import threading
 
 _cache_lock=threading.Lock()
@@ -12,13 +13,7 @@ _cache:dict[str,str]=json.loads(CACHE.read_text()) if CACHE.exists() else {}
 _OK_MIME={"image/png","image/jpeg","image/webp"}
 MIN_PX=120  # skip icons/bullets smaller than this on either side
 
-DESCRIBE=("You are indexing study notes for search. Describe this image so the description can stand in for it in a text index. "
-          "For diagrams/charts/figures: say what it shows, labels/axes, key values and the main takeaway. "
-          "Write equations as LaTeX and copy any visible text verbatim. "
-          "If it is purely decorative (logo, icon, background), reply exactly: SKIP\n\n"
-          "Surrounding text for context:\n{ctx}")
-OCR=("This is a scanned page. Transcribe all text exactly, keeping paragraphs and lists. "
-     "Write equations as LaTeX. Briefly describe any figures in [brackets] where they appear.")
+OCR=prompt("VISION_OCR")
 
 def prepare(blob:bytes,mime:str)->tuple[bytes,str]|None:
     """Return (bytes, mime) Gemini accepts, or None for tiny/unsupported images (e.g. EMF/WMF)."""
@@ -52,9 +47,9 @@ def caption(img:bytes,mime:str,ctx:str="",ocr:bool=False)->str:
     key=hashlib.sha256(img).hexdigest()+(":ocr" if ocr else "")   # provider-independent: cache survives a switch
     if key in _cache:
         return _cache[key]
-    prompt=OCR if ocr else DESCRIBE.format(ctx=ctx[:1500])
+    instruction=OCR if ocr else prompt("VISION_DESCRIBE",ctx=ctx[:1500])
     msg=HumanMessage(content=[{"type":"image","base64":base64.b64encode(img).decode(),"mime_type":mime},
-                              {"type":"text","text":prompt}])
+                              {"type":"text","text":instruction}])
     text=text_of(_vision_llm().invoke([msg])).strip()
     text="" if text=="SKIP" else text
     with _cache_lock:

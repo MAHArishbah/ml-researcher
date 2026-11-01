@@ -1,20 +1,27 @@
 # ML Researcher
 
-A personal research agent for machine-learning topics. You ask a question, and it searches **arXiv, your own notes, your own code, GitHub and YouTube** in parallel. It then writes a study brief with math rendered as LaTeX. Follow-up questions are answered from the conversation, without searching again.
+A personal research agent for machine-learning topics. You ask a question, and it searches **arXiv, your own notes, your own code, GitHub and YouTube** in parallel, plus the web when you ask with `/web`. It then writes a study brief that answers every part of your question, with math rendered as LaTeX. Follow-up questions are answered from the conversation, without searching again. A **Dashboard** page shows how the agent itself is behaving.
 
 It's built on LangGraph with Gemini (through Vertex AI). Your notes (PDF, Word, PowerPoint, Markdown) are indexed into a local Chroma database, and figures and diagrams are captioned by Gemini so they can be searched too.
 
 ```
                     ┌─> arxiv_researcher   ─┐
                     ├─> notes_researcher   ─┤
-router ─> planner ──┼─> code_researcher    ─┼─> reviewer ─> synthesizer ─> study brief
-   │                ├─> github_researcher  ─┤     │  ▲
-   │                └─> youtube_researcher ─┘     ▼  │
+                    ├─> code_researcher    ─┤
+router ─> planner ──┼─> github_researcher  ─┼─> reviewer ─> synthesizer ─> study brief
+   │                ├─> youtube_researcher ─┤     │  ▲
+   │                └─> web_researcher     ─┘     ▼  │      (web: only with /web)
    │                               follow-ups: search a source again, or a Python check
    └─> answer  (follow-ups: answered from the conversation, no search)
 ```
 
 After the first pass, a **reviewer** looks for gaps. For example, a video might use a term your notes weren't searched for, or a formula could be checked. It can then send follow-ups back to any source, or ask for a **Python check**. The brief gets a `## Checks` section when one runs. The review is optional: if its call fails (for example while Google is overloaded), the brief is written from the researchers' findings and `review_skipped` is logged, instead of the turn failing.
+
+**When Google is slow or busy:**
+- **The router fails soft.** If the routing call gets no answer, the route is decided in code: `/web`, `/read` or a mention of your notes or code → research; an earlier brief in the conversation → answer; otherwise → research. This is logged as `router_fallback`, and the UI says so.
+- **"It's in my notes" means search.** A message that points at your own material (*in my notes*, *check my code*, *in my notebooks*) always goes to research. The answer step can only use the conversation.
+- **429 back-off.** If the synthesizer or answer is refused with a 429 after Google's own quick retries, the same model is retried after 10 s and then 30 s (`model_backoff`). The UI shows "Google is busy, retrying in 30 s…".
+- **Long thinking isn't a stall.** The answer and brief model often reasons for 30–60 s before its first word. The UI shows "Thinking…" as soon as that step starts, and its silence limit is `REPLY_TIMEOUT` (90 s). A call that hangs is retried after 90 s.
 
 **Loop guards** (constants at the top of `graph.py`):
 - **Inside each researcher:**
@@ -35,7 +42,7 @@ After the first pass, a **reviewer** looks for gaps. For example, a video might 
 - **Tool output is marked as data.** It is wrapped in `<tool_result>` / `<findings>` tags, and the prompts say never to follow instructions inside them.
 - **Only verified links reach you.** Briefs keep only URLs that a tool returned in its structured `url` field, and follow-up answers only links already in the conversation. Anything else is stripped and logged as `url_removed`.
 - **Suspicious phrases are flagged.** Phrases like "ignore previous instructions" in tool or Python output are logged as `injection_suspect`, and a warning is attached for the model.
-- **Other limits:** secrets never enter prompts, Python runs only in the provider's sandbox, the UI never renders raw HTML, and code enforces the loop and follow-up limits whatever a model asks for.
+- **Other limits:** secrets never enter prompts, Python runs only in the provider's sandbox, model text is never rendered as raw HTML (the page's only script is the app's own ↑/↓ prompt history, which receives your prompts as escaped JSON), and code enforces the loop and follow-up limits whatever a model asks for.
 
 **Web search for new papers (`/web`).** Put `/web` anywhere in a question (for example `/web latest papers on flow matching`) to add a Gemini Google Search pass beside the other researchers. It is off for every other question, and `WEB_SEARCH=false` switches it off entirely. Guardrails:
 - **Gemini's written answer is discarded;** only its list of sources is used.
@@ -73,6 +80,7 @@ GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_GENAI_USE_VERTEXAI=TRUE
 GOOGLE_CLOUD_LOCATION=global
 MAIN_MODEL=google_genai:gemini-3.8-flash          # router, planner, reviewer, synthesizer, answers
+                                                  # (gemini-3.7-flash if 3.8 drops requests: see Troubleshooting)
 RESEARCHER_MODEL=google_genai:gemini-3.5-flash-lite   # the 5 researchers + image captions
 # Claude instead: MAIN_MODEL=anthropic:claude-sonnet-5-5 and ANTHROPIC_API_KEY=...  (embeddings stay on Gemini)
 EMBED_MODEL=gemini-embedding-2
@@ -106,6 +114,7 @@ LOG_TO_GCP=true                          # optional, see Monitoring
 | `LLM_RPS` | `5` | maximum model calls per second, spaced evenly: per process (chat, UI) **and combined across all processes** (UI + daily ingest + eval), coordinated through `~/.ml_researcher/pacer.slot`; `0` means no limit (`GEMINI_RPS` still works) |
 | `BATCH_RPS` | `1` | stricter pace that `ingest` and `evaluate` switch to, for long runs |
 | `SUMMARY_TRIGGER_TOKENS` | `30000` | follow-ups: once a conversation is this long, older turns are summarised; the latest brief and the last 3 turns stay word for word |
+| `REPLY_TIMEOUT` | `90` | silence limit for the answer and synthesizer (they reason silently for 30–60 s before the first token) |
 | `LLM_TIMEOUT`, `FAST_LLM_TIMEOUT`, `SANDBOX_TIMEOUT` | `90`, `45`, `180` | seconds of silence on a model connection before the call is cut and retried (same model, 3 attempts in all). Answers that keep streaming are never cut; Google's own deadline for a whole request is 600 s |
 | `CHECKPOINT_DB` | `~/.ml_researcher/checkpoints.sqlite` | saved conversations |
 | `LOG_DIR` | `~/.ml_researcher/logs` | local JSON logs |
@@ -113,6 +122,7 @@ LOG_TO_GCP=true                          # optional, see Monitoring
 | `LOG_TO_GCP` | `false` | also send logs to Cloud Logging |
 | `LOG_NAME` | `ml-researcher` | Cloud Logging log name |
 | `LOG_PROMPTS` | `true` | include prompt text in request logs |
+| `DASHBOARD_TZ` | `UTC` | time zone for the dashboard page, e.g. `Asia/Kolkata` |
 | `RAG_LOCATION`, `RAG_CORPUS_NAME` | `europe-west4`, `ml-notes` | only used with `rag_engine` |
 
 </details>
@@ -184,11 +194,15 @@ A fifth researcher searches it (`search_my_code`), and briefs gain a `## My code
 streamlit run ui.py
 ```
 
-- Conversations are saved; switch between them or start new ones from the sidebar.
+- Conversations are saved; switch between them or start new ones from the sidebar. **☆ Star** moves the current conversation to a separate **★ Starred** picker (and out of **Conversations**); **★ Starred** moves it back. Stars are kept in a `starred` table in `checkpoints.sqlite`.
 - Replies stream in as they're written, with LaTeX rendered.
 - **⏹ Stop** cancels a reply mid-way and puts your prompt back in the box to edit.
+- **Copy** under every prompt and reply opens its raw text (markdown and LaTeX source) with a copy icon.
 - The sidebar shows the search queries used and the raw findings from each source.
 - You can download the last reply as Markdown.
+- **↑ / ↓** in the chat box step through this conversation's earlier prompts (on the first / last line of the box).
+- The sidebar has two pages: **Researcher** (the chat) and **Dashboard** (the local log dashboard, see Monitoring).
+- **«** at the top of the sidebar collapses it; **»** at the top left opens it again.
 
 **Terminal:**
 
@@ -198,17 +212,36 @@ python -m ml_researcher.chat --thread flow-matching    # reuse a thread name to 
 
 Commands: `/state`, `/graph` (prints a Mermaid diagram), `/quit`.
 
+### Changing prompts
+
+All model instructions live in [`ml_researcher/prompts.md`](ml_researcher/prompts.md): the router, planner, researchers, reviewer, study brief, answers, summaries, `/read` and `/web`, image captions and the evaluation prompts. Each starts at a `=== NAME ===` line, with a note on which step uses it and which `{placeholders}` the code fills in. Edit the text and restart the app. Tool descriptions are the one exception: they stay as docstrings in `tools.py`, where LangChain reads each tool's argument descriptions.
+
+The planner, reviewer and brief writer see your full message, not just the router's short topic, and the brief has a **Your questions** section that answers every part of your request under its own heading. Each point under **What my notes cover** ends with the file(s) it came from, e.g. `(GLM_reference_notes.pdf)`.
+
 ## Monitoring
 
 Every turn writes JSON log lines to `~/.ml_researcher/logs/agent.jsonl`:
 - one `step` event per graph node
-- one `request` event per turn, with status, error code, route, turn number, latency, time to first token (TTFT), time per output token (TPOT) and token counts
+- one `request` event per turn, with status, error code, route, turn number, main and researcher model, latency, time to first token (TTFT), time per output token (TPOT) and token counts
 
 Indexing also writes an `ingest_file` event per file. To summarize the local log:
 
 ```bash
 python -m ml_researcher.log_report --last 200    # p50 / p95 per metric and per step
 ```
+
+**Local dashboard.** The **Dashboard** page in the web UI's sidebar reads the same log and refreshes every 30 s. It doesn't repeat the Cloud dashboard's p50/p95 trends; it breaks them down instead:
+
+| Panel | Shows |
+|---|---|
+| 1. Speed by model | p50 / p95 time to first word and latency, failure rate and cache hits per main model; each turn as a dot (time to first word against input tokens) |
+| 2. Where the time goes | the last 15 turns as bars split into wall-clock phases: route, plan, research (parallel), review, write, unfinished / waiting |
+| 3. Reliability | retried model calls per hour by cause (ReadTimeout, ConnectError, 429), which never reach Cloud Logging; failed and stopped turns with the step that failed |
+| 4. Context growth | input tokens turn by turn for the 8 most recently active conversations |
+| 5. Tool mix | calls per research turn for each tool, and the share of turns that use it |
+| 6. One turn's timeline | a chosen turn's steps on a time axis, with retried calls marked and any time stuck in an unfinished call |
+
+Filters in the sidebar: time range, route and main model. Turns logged before the model field existed show as "not logged". Times are in `DASHBOARD_TZ` (default UTC; e.g. `Asia/Kolkata`).
 
 With `LOG_TO_GCP=true`, the same events go to Cloud Logging. To create the log-based metrics and the **"ML Researcher Agent"** dashboard (requests, errors, p50/p95 latency, TTFT, TPOT, step latency, input and output tokens per turn, tool calls per research turn), run this once:
 
@@ -304,7 +337,7 @@ Measured on 29 October 2026 with `log_report`, on a WSL2 laptop, with `gemini-3.
 
 | Route | Turns | Latency p50 / p95 | TTFT p50 / p95 | TPOT p50 / p95 |
 |---|---|---|---|---|
-| Research (new topic, all 4 sources) | 4 | 63 s / 111 s | 51 s / 100 s | 7.4 / 8.8 ms |
+| Research (new topic, the 4 sources of the time) | 4 | 63 s / 111 s | 51 s / 100 s | 7.4 / 8.8 ms |
 | Answer (follow-up, no search) | 14 | 15 s / 164 s* | 14 s / 164 s* | 6.4 / 11.4 ms |
 
 \* The follow-up p95 comes from the WSL network stall described under [Troubleshooting](#troubleshooting): the router waited 60–120 s for a connection. Without stalls, follow-ups take 4–15 s.
@@ -320,7 +353,7 @@ Measured on 29 October 2026 with `log_report`, on a WSL2 laptop, with `gemini-3.
 | synthesizer | 42 s | 93 s |
 | answer | 10 s | 104 s* |
 
-The four researchers run in parallel, so the research phase takes about as long as the slowest one, roughly 10–15 s. Most of a research turn is the synthesizer reasoning before it writes, which accounts for about 90% of its output tokens.
+The researchers run in parallel (four at the time of measuring; the code and web researchers came later), so the research phase takes about as long as the slowest one, roughly 10–15 s. Most of a research turn is the synthesizer reasoning before it writes, which accounts for about 90% of its output tokens.
 
 **Indexing** (`FILE_WORKERS=3`, `EMBED_WORKERS=4`): in the first 90 minutes of a full run, 644 files were processed: 640 indexed, 4 with no text, none failed.
 - p50: 5.8 s per file. Most are short papers and notes.
@@ -345,7 +378,8 @@ ruff format --diff .  # preview formatting changes (ruff format . applies them)
 
 | Path | What it does |
 |---|---|
-| `ui.py` | Streamlit app: streaming replies, ⏹ Stop, LaTeX rendering, conversations in the sidebar |
+| `ui.py` | Streamlit entry point (`streamlit run ui.py`): registers the two pages and keeps the sidebar's collapse button visible |
+| `app_pages/researcher.py` | the **Researcher** page: the chat, with streaming replies, ⏹ Stop, copy buttons, ↑/↓ prompt history, LaTeX rendering, conversations in the sidebar |
 | `ml_researcher/chat.py` | terminal chat |
 | `ml_researcher/runner.py` | runs one turn: streaming, cancellation, telemetry (latency, TTFT, TPOT, tokens) |
 
@@ -354,17 +388,18 @@ ruff format --diff .  # preview formatting changes (ruff format . applies them)
 | Path | What it does |
 |---|---|
 | `ml_researcher/graph.py` | the agent graph: router, planner, guarded researchers, reviewer and follow-ups, Python checks, synthesizer, answer |
-| `ml_researcher/guards.py` | hashes for tool calls, results and follow-ups (repeat and progress detection) |
-| `ml_researcher/tools.py` | arXiv, notes, GitHub and YouTube search tools |
+| `ml_researcher/prompts.md` | **every prompt the agent sends to a model**, in one file: edit here, restart the app |
+| `ml_researcher/prompts.py` | loads `prompts.md`; `prompt("NAME", **values)` fills `{placeholders}` |
+| `ml_researcher/guards.py` | hashes for tool calls, results and follow-ups (repeat and progress detection); link filter; injection check |
+| `ml_researcher/tools.py` | the 5 search tools: arXiv, your notes, your code, GitHub, YouTube |
+| `ml_researcher/websearch.py` | `/web` search: Gemini Google Search as a source finder; domain allowlist, arXiv-API verification |
+| `ml_researcher/urlreader.py` | `/read <url>`: fetch one user-given page or PDF as text (HTTPS, public addresses only, size caps) |
 
 **Models: provider-agnostic, each provider behind its own adapter**
 
 | Path | What it does |
 |---|---|
-| `ml_researcher/llm.py` | chat models: `chat_model("provider:model", effort)` for Gemini (Vertex AI) or Claude; one `effort` setting mapped to each provider |
-| `ml_researcher/urlreader.py` | `/read <url>`: fetch one user-given page or PDF as text (HTTPS, public addresses only, size caps) |
-| `ml_researcher/codeindex.py` | your code as a separate index: structure-aware chunks, secret-file skipping and redaction |
-| `ml_researcher/websearch.py` | `/web` search: Gemini Google Search as a source finder; domain allowlist, arXiv-API verification |
+| `ml_researcher/llm.py` | chat models: `chat_model("provider:model", effort)` for Gemini (Vertex AI) or Claude; one `effort` setting mapped to each provider; silence timeouts, retries, idle connections closed after 20 s |
 | `ml_researcher/sandbox.py` | `CodeSandbox` interface for Python checks: Gemini or Claude **hosted** code execution, or none; code never runs locally |
 | `ml_researcher/cache.py` | prompt caching per provider: Gemini explicit caches (only above Vertex's 4,096-token minimum) or Claude `cache_control` breakpoints |
 | `ml_researcher/ratelimit.py` | pacing for every model call: each process's own pace (`LLM_RPS`, or `BATCH_RPS` for batch jobs) plus one combined limit across all processes (a file-locked shared timeline) |
@@ -374,7 +409,8 @@ ruff format --diff .  # preview formatting changes (ruff format . applies them)
 
 | Path | What it does |
 |---|---|
-| `ml_researcher/ingest.py` | indexing pipeline (LangGraph map-reduce over files), incremental by modification time |
+| `ml_researcher/ingest.py` | indexing pipeline (LangGraph map-reduce over files), incremental by modification time; `--code` indexes your code |
+| `ml_researcher/codeindex.py` | your code as a separate index: structure-aware chunks, secret-file skipping and redaction |
 | `ml_researcher/readers.py` | PDF, DOCX, PPTX and Markdown readers; paragraph- and sentence-aware chunking |
 | `ml_researcher/vision.py` | image captions with any multimodal model (`VISION_MODEL`), with cache |
 | `ml_researcher/embeddings.py` | Gemini embeddings, with retry |
@@ -390,14 +426,32 @@ ruff format --diff .  # preview formatting changes (ruff format . applies them)
 | `ml_researcher/evaluate.py` | golden-set builder; retrieval metrics; DeepEval generation metrics (resumable) |
 | `evals/golden.jsonl`, `evals/runs/` | the 100-question golden set, and every eval run's `summary.json` and `per_query.jsonl` |
 | `ml_researcher/logging_config.py`, `log_report.py` | logging setup (local JSON file and Cloud Logging); local p50/p95 summary |
+| `ml_researcher/log_data.py` | reads the local log into DataFrames (requests, steps, retried calls) for the dashboard |
+| `app_pages/dashboard.py` | the **Dashboard** page: the local log dashboard |
 | `scripts/setup_gcp_metrics.py` | Cloud Monitoring log-based metrics and dashboard |
 | `scripts/daily_ingest.sh` | daily incremental re-index, run by Windows Task Scheduler |
 | `scripts/run_eval.sh` | generation eval as a detached, resumable batch job |
 | `test_readers.py`, `inspect_db.py` | check what one file extracts to; inspect the index (with an optional test search) |
 
-All runtime data lives in `~/.ml_researcher/`: the vector database, saved conversations, the caption cache and logs. The only exception is evaluation output, which is written to `evals/` in the project so it can be versioned.
+All runtime data lives in `~/.ml_researcher/`: the vector database, saved conversations (and their stars), the caption cache, logs, and `pacer.slot` (the shared rate-limit clock). The only exception is evaluation output, which is written to `evals/` in the project so it can be versioned.
 
 ## Troubleshooting
+
+- **"Working…" with no step ticked, then `ReadTimeout`, or `RESOURCE_EXHAUSTED`.** Google's capacity for the model is stalled or busy, not the agent. `grep -h Retrying ~/.ml_researcher/logs/agent.jsonl | tail` shows the retries. Router failures now fall back to routing in code and busy brief/answer calls back off, but if every call stalls, wait a few minutes and resend. A turn you stop with ⏹ leaves the conversation unchanged.
+
+- **Turns stall for 45–90 s at a step, then the retry answers in seconds.** The model is dropping requests: one attempt gets no reply at all, and the same request sent again works. The Dashboard's Reliability panel shows it as bursts of `ReadTimeout`. Confirm it outside the app with plain `curl` (no Python, no app code); `000` means no reply:
+  ```bash
+  TOKEN=$(python -c "import google.auth, google.auth.transport.requests as r; c,_=google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform']); c.refresh(r.Request()); print(c.token)")
+  MODEL=gemini-3.8-flash; GOOGLE_CLOUD_PROJECT=$(grep '^GOOGLE_CLOUD_PROJECT=' .env | cut -d= -f2)
+  for i in $(seq 1 8); do curl -s -o /dev/null -m 30 -w "%{http_code} %{time_starttransfer}s\n" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"contents":[{"role":"user","parts":[{"text":"Say ok."}]}]}' \
+    "https://aiplatform.googleapis.com/v1/projects/$GOOGLE_CLOUD_PROJECT/locations/global/publishers/google/models/$MODEL:generateContent" \
+    || echo "no reply"; done
+  ```
+  On 1 November, 20–40% of `gemini-3.8-flash` requests were dropped from three different networks while `gemini-3.7-flash` and the 3.5–3.6 models dropped none. Google's status page stayed green. Switch the main model in `.env` to one that drops nothing, restart, and try the newer model again later. A real quota limit looks different: an instant `429 RESOURCE_EXHAUSTED`.
+- **`Network is unreachable` (Errno 101) or `ConnectError` in the log.** The machine briefly had no route out; this comes from the Linux kernel, not from Google. If it keeps happening, restart WSL's network with `wsl --shutdown` in PowerShell.
+- **`oauth2.googleapis.com ... Read timed out`** or "network error during authentication". The hourly renewal of your gcloud access token got no reply. The router falls back to routing in code; resend if a later step failed.
 
 - **The first request after the app has been idle stalls for 60 or 120 s (WSL).** The stall happens while connecting over IPv6. Make the system prefer IPv4:
   ```bash

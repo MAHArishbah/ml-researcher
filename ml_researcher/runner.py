@@ -5,14 +5,14 @@ latency, TTFT (time to first reply token), TPOT (time per output token after the
 token usage, route, turn number and status / error_code.
 """
 import logging
-from collections import Counter
 import time
 import uuid
+from collections import Counter
 from typing import Callable, Optional
 
 from langchain_core.messages import AIMessageChunk, HumanMessage
 
-from .config import LOG_PROMPTS
+from .config import LOG_PROMPTS, MAIN_MODEL, RESEARCHER_MODEL
 from .llm import text_of
 
 log = logging.getLogger("ml_researcher.requests")
@@ -40,9 +40,11 @@ def _ms(seconds: Optional[float]) -> Optional[int]:
 def run_turn(graph, thread_id: str, prompt: str,
              on_step: Optional[Callable[[str, str], None]] = None,
              on_token: Optional[Callable[[str], None]] = None,
-             should_stop: Optional[Callable[[], bool]] = None) -> str:
+             should_stop: Optional[Callable[[], bool]] = None,
+             on_notice: Optional[Callable[[str], None]] = None) -> str:
     """Stream one turn. on_step(node, status) after each node; on_token(text_so_far) per reply chunk.
     should_stop() is polled on every stream event; True aborts the turn with TurnCancelled.
+    on_notice(message) receives status messages from inside the graph (e.g. "Google is busy, retrying in 30 s").
     Returns the final reply text; re-raises any error after logging it."""
     cfg = {"configurable": {"thread_id": thread_id}}
     ids = {"request_id": uuid.uuid4().hex[:12], "thread_id": thread_id}
@@ -55,13 +57,21 @@ def run_turn(graph, thread_id: str, prompt: str,
     try:
         # "tasks" = node start/finish events, "messages" = (token chunk, metadata) from every LLM call
         for mode, data in graph.stream({"messages": [HumanMessage(prompt)]}, cfg,
-                                       stream_mode=["tasks", "messages"]):
+                                       stream_mode=["tasks", "messages", "custom"]):
             if should_stop and should_stop():
                 raise TurnCancelled()
             now = time.monotonic()
+            if mode == "custom":                     # a node's status message (get_stream_writer)
+                if on_notice and isinstance(data, dict) and data.get("notice"):
+                    on_notice(data["notice"])
+                continue
             if mode == "tasks":
                 if "triggers" in data:               # task started
                     started[data["id"]] = now
+                    if data["name"] in REPLY_NODES and on_notice:
+                        # Gemini sends thought summaries only once it has finished thinking (often 30-60 s),
+                        # so say so as the reply step starts rather than waiting for the first thought block
+                        on_notice("Thinking… (the model reasons before writing; 30-60 s is normal)")
                     continue
                 result = data.get("result") or {}
                 result = dict(result) if isinstance(result, list) else result
@@ -114,6 +124,7 @@ def run_turn(graph, thread_id: str, prompt: str,
                  if values.get("route") == "research" else [])
         fields = {**ids, "event": "request", "status": status, "error_code": error_code, "error": error,
                   "route": values.get("route"), "turn": turn,
+                  "main_model": MAIN_MODEL.split(":", 1)[-1], "researcher_model": RESEARCHER_MODEL.split(":", 1)[-1],
                   "tool_calls": len(calls), "tool_call_counts": dict(Counter(calls)),
                   "latency_ms": _ms(latency),
                   "ttft_ms": _ms(t_first - t0 if t_first else None),

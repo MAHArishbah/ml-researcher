@@ -19,7 +19,11 @@ def _cohere():
     with _lock:
         if _client is None:
             import cohere
-            _client = cohere.ClientV2(api_key=COHERE_API_KEY, timeout=30)
+            import httpx
+
+            from .llm import FRESH_CONNECTIONS          # don't reuse idle connections WSL may have dropped
+            _client = cohere.ClientV2(api_key=COHERE_API_KEY, timeout=30,
+                                      httpx_client=httpx.Client(timeout=30, limits=FRESH_CONNECTIONS))
     return _client
 
 

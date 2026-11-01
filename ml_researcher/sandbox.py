@@ -5,12 +5,17 @@ Model-written code only ever runs in the provider's own sandbox (no network, no 
 Nothing is executed locally. With CODE_SANDBOX=none (or an unsupported provider) Python checks are disabled
 and the reviewer's python follow-ups are dropped.
 """
+import warnings
 from dataclasses import dataclass
 from typing import Protocol
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .config import CODE_SANDBOX, MAIN_MODEL, SANDBOX_TIMEOUT
+
+# langchain-google-genai warns on every reply that contains executed code that the result block may be
+# absent; GeminiSandbox.run already handles a missing result, so the notice is just terminal noise
+warnings.filterwarnings("ignore", message=r"\s*Warning: Output may vary each run", category=UserWarning)
 
 
 @dataclass

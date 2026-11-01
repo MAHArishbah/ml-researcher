@@ -51,7 +51,8 @@ def main():
             try:
                 run_turn(graph, args.thread, text,
                          on_step=lambda node, status: print(f"  {'✓' if status == 'ok' else '⚠'} {node}"),
-                         on_token=on_token)
+                         on_token=on_token,
+                         on_notice=lambda message: print(f"  \u23f3 {message}"))
                 print()
             except KeyboardInterrupt:
                 print("\n  (stopped)")

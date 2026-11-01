@@ -8,14 +8,19 @@ Supported providers: google_genai (Gemini on Vertex AI) and anthropic (Claude, n
 Provider-specific extras live behind their own small interfaces: sandbox.py (hosted Python) and cache.py
 (prompt caching).
 """
+import httpx
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 
-from .config import FAST_LLM_TIMEOUT, LLM_TIMEOUT, LOCATION, MAIN_MODEL, PROJECT, RESEARCHER_MODEL
+from .config import FAST_LLM_TIMEOUT, LLM_TIMEOUT, LOCATION, MAIN_MODEL, PROJECT, REPLY_TIMEOUT, RESEARCHER_MODEL
 from .ratelimit import PACER
 
 PROVIDERS = ("google_genai", "anthropic")
 SERVER_DEADLINE = 600              # s: Google-side limit for a whole request (a long answer must never hit it)
+# Close pooled connections idle for over 20 s instead of reusing them. WSL's NAT silently drops idle TCP
+# connections; a request sent on one is never delivered and just waits out the silence timeout (then the
+# retry, on a new connection, answers in seconds). A fresh connection costs ~50 ms.
+FRESH_CONNECTIONS = httpx.Limits(keepalive_expiry=20)
 
 
 def _provider_kwargs(provider: str, effort: str | None) -> dict:
@@ -25,7 +30,8 @@ def _provider_kwargs(provider: str, effort: str | None) -> dict:
         # cut long streamed answers. Setting the header ourselves keeps Google's deadline generous while `timeout`
         # still limits silence on the connection locally.
         kw = {"vertexai": True, "project": PROJECT, "location": LOCATION,
-              "additional_headers": {"X-Server-Timeout": str(SERVER_DEADLINE)}}
+              "additional_headers": {"X-Server-Timeout": str(SERVER_DEADLINE)},
+              "client_args": {"limits": FRESH_CONNECTIONS}}
         return {**kw, "thinking_level": effort} if effort else kw
     if provider == "anthropic":
         kw = {"max_tokens": 16000}                         # briefs are long; the SDK default is small
@@ -55,7 +61,9 @@ def structured(llm, schema):
     return llm.with_structured_output(schema, method="json_schema")
 
 
-MAIN_LLM = chat_model(MAIN_MODEL)
+# writes what the user reads (briefs, answers); it thinks silently before its first token, so its silence
+# limit is REPLY_TIMEOUT (90 s)
+MAIN_LLM = chat_model(MAIN_MODEL, timeout=REPLY_TIMEOUT)
 FAST_LLM = chat_model(MAIN_MODEL, effort="low", timeout=FAST_LLM_TIMEOUT)
 RESEARCH_LLM = chat_model(RESEARCHER_MODEL, effort="low", timeout=FAST_LLM_TIMEOUT)    # tool-calling researchers
 

@@ -37,7 +37,8 @@ LLM_RPS = float(os.getenv("LLM_RPS") or os.getenv("GEMINI_RPS", "5"))  # max mod
 # Streaming answers that keep sending tokens never hit it; only a request that gets no reply does.
 SUMMARY_TRIGGER_TOKENS = int(os.getenv("SUMMARY_TRIGGER_TOKENS", "30000"))  # follow-ups: summarise older turns
                                                                           # once the conversation is this long
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "90"))            # answers, briefs, captions, judge (thinking can take ~50 s)
+REPLY_TIMEOUT = float(os.getenv("REPLY_TIMEOUT", "90"))          # answer + synthesizer
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "90"))            # captions, judge, article condensing, summaries
 FAST_LLM_TIMEOUT = float(os.getenv("FAST_LLM_TIMEOUT", "45"))  # router, planner, reviewer, researchers (normally 2-10 s)
 SANDBOX_TIMEOUT = float(os.getenv("SANDBOX_TIMEOUT", "180"))   # Python checks: code runs before any reply comes back
 BATCH_RPS = float(os.getenv("BATCH_RPS", "1"))       # stricter pace for batch jobs (ingest, evaluate)
@@ -52,6 +53,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_TO_GCP = os.getenv("LOG_TO_GCP", "false").lower() == "true"   # also ship logs to Cloud Logging
 LOG_NAME = os.getenv("LOG_NAME", "ml-researcher")                  # Cloud Logging log name
 LOG_PROMPTS = os.getenv("LOG_PROMPTS", "true").lower() == "true"    # include prompt text in request logs
+DASHBOARD_TZ = os.getenv("DASHBOARD_TZ", "UTC")                    # times on the dashboard page, e.g. Asia/Kolkata
 
 
 RAG_LOCATION = os.getenv("RAG_LOCATION", "europe-west4")

@@ -32,6 +32,7 @@ from tqdm import tqdm
 from . import config, ratelimit, rerank, store_chroma
 from .config import DOCS_DIR, JUDGE_MODEL, MAIN_MODEL
 from .llm import chat_model, structured, text_of
+from .prompts import prompt
 from .logging_config import setup_logging
 from .readers import to_wsl_path
 
@@ -56,23 +57,11 @@ class QA(BaseModel):
     answer: str = Field(description="reference answer to the question in 1-3 sentences (empty string only if skip)")
 
 
-RULES = """- Ask it as a standalone question a student revising machine learning would type into a search box.
-- Never refer to "the passage", "the text", "the notes", "the document" or the author.
-- Paraphrase: do not copy distinctive phrases from the passage(s) into the question.
-- Name the concept(s) involved so the question is unambiguous without the passage.
-- The reference answer is 1-3 sentences and fully supported by the passage(s)."""
+RULES = prompt("EVAL_RULES")
 
-SINGLE_PROMPT = f"""You write evaluation questions for a search engine over a student's ML notes and books.
-From the passage, write ONE question answerable from this passage alone, plus its reference answer.
-{RULES}
-Set skip=true if the passage is a table of contents, references, an index, boilerplate, code only,
-or too fragmentary to support a meaningful question."""
+SINGLE_PROMPT = prompt("EVAL_SINGLE", rules=RULES)
 
-MULTI_PROMPT = f"""You write multi-hop evaluation questions for a search engine over a student's ML notes and books.
-You get two passages from DIFFERENT documents. Write ONE question whose answer needs facts from BOTH passages
-(e.g. compare them, connect them, or apply one to the other), plus a reference answer that uses both.
-{RULES}
-Set skip=true if the passages can't be meaningfully combined into one question."""
+MULTI_PROMPT = prompt("EVAL_MULTI", rules=RULES)
 
 
 def _text_hash(text: str) -> str:
@@ -290,8 +279,7 @@ def retrieval(args):
 
 # ---------------------------------------------------------------- generation metrics (DeepEval)
 
-ANSWER_PROMPT = """Answer the question using ONLY the numbered excerpts from the user's notes below.
-Be concise (2-5 sentences), keep LaTeX math as $...$, and say so if the excerpts don't contain the answer."""
+ANSWER_PROMPT = prompt("EVAL_ANSWER")
 
 
 def _answer(item: dict, top_k: int) -> dict:
@@ -347,11 +335,7 @@ def _metrics(judge) -> dict:
             name="Answer correctness", model=judge, async_mode=False,
             evaluation_params=[SingleTurnParams.INPUT, SingleTurnParams.ACTUAL_OUTPUT,
                                SingleTurnParams.EXPECTED_OUTPUT],
-            evaluation_steps=[
-                "Compare the facts in the actual output with the expected output.",
-                "Penalise facts that contradict the expected output heavily.",
-                "Penalise missing key facts from the expected output; extra correct detail is fine.",
-                "Ignore wording, formatting and LaTeX notation differences."]),
+            evaluation_steps=prompt("EVAL_CORRECTNESS_STEPS").splitlines()),
     }
 
 
