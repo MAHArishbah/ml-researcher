@@ -196,7 +196,7 @@ streamlit run ui.py
 
 - Conversations are saved; switch between them or start new ones from the sidebar. **☆ Star** moves the current conversation to a separate **★ Starred** picker (and out of **Conversations**); **★ Starred** moves it back. Stars are kept in a `starred` table in `checkpoints.sqlite`.
 - Replies stream in as they're written, with LaTeX rendered.
-- **⏹ Stop** cancels a reply mid-way and puts your prompt back in the box to edit.
+- **⏹ Stop** cancels a reply mid-way and puts your prompt back in the box to edit. A turn that **fails** (for example after every retry timed out) is undone the same way: the conversation is left unchanged, the error is shown, and your question is back in the box to resend.
 - **Copy** under every prompt and reply opens its raw text (markdown and LaTeX source) with a copy icon.
 - The sidebar shows the search queries used and the raw findings from each source.
 - You can download the last reply as Markdown.

@@ -164,6 +164,17 @@ def stop_and_edit():
     st.session_state.chat_box = st.session_state.get("pending_prompt", "")
 
 
+def roll_back(stop: threading.Event, pre_turn, thread_id: str):
+    """Undo a turn that was stopped or failed: the pre-turn checkpoint becomes the latest again (or a brand-new
+    thread is deleted), so the conversation never keeps a question without its answer."""
+    with saver.lock:
+        stop.set()                           # from here on the worker can't write to the thread
+        if pre_turn:
+            graph.update_state(pre_turn, None, as_node="__copy__")
+        else:
+            saver.delete_thread(thread_id)
+
+
 saver, graph = backend()
 threads = list_threads(saver)
 if "thread" not in st.session_state:
@@ -226,6 +237,12 @@ if messages and not isinstance(messages[-1], HumanMessage):
     st.download_button("Download last reply (.md)", text_of(messages[-1]),
                        file_name=f"{st.session_state.thread}.md", mime="text/markdown")
 
+if failure := st.session_state.pop("failed_turn", None):      # set by a failed turn just before its rerun
+    st.error(f"That turn failed and was undone, so the conversation is unchanged. Your question is back in the "
+             f"box: press Enter to resend it.\n\n`{failure[:500]}`")
+if (restore := st.session_state.pop("restore_prompt", None)) is not None:
+    st.session_state.chat_box = restore                         # before the chat box is drawn, so it shows
+
 past_prompts = [text_of(m) for m in messages if isinstance(m, HumanMessage)]
 st.html(PROMPT_HISTORY_JS % json.dumps(past_prompts).replace("</", "<\\/"), unsafe_allow_javascript=True)
 
@@ -276,18 +293,14 @@ if prompt := st.chat_input("Ask about an ML topic, or follow up on a brief", key
                     reply.markdown(to_streamlit_md(text) + " ▌")   # unfinished $..$ stays plain until closed
                     last_draw = time.monotonic()
         except BaseException:                # Stop click, another widget, or the tab was closed
-            with saver.lock:
-                stop.set()                   # from here on the worker can't write to the thread
-                if pre_turn:                 # make the pre-turn checkpoint the latest again
-                    graph.update_state(pre_turn, None, as_node="__copy__")
-                else:
-                    saver.delete_thread(st.session_state.thread)
+            roll_back(stop, pre_turn, st.session_state.thread)
             raise
 
         stop_slot.empty()
-        if failed is not None:
-            status.update(label="Failed", state="error")
-            st.error(f"{type(failed).__name__}: {failed}")
-            st.stop()
+        if failed is not None:               # undo it like a Stop; show why, with the question back in the box
+            roll_back(stop, pre_turn, st.session_state.thread)
+            st.session_state.failed_turn = f"{type(failed).__name__}: {failed}"
+            st.session_state.restore_prompt = prompt
+            st.rerun()
         reply.markdown(to_streamlit_md(final))
     st.rerun()                               # redraw history + sidebar from the saved state
