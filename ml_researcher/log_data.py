@@ -1,7 +1,8 @@
 """The local JSON-lines log as DataFrames, for the dashboard page (app_pages/dashboard.py).
 
 requests: one row per turn (event "request");  steps: one row per graph node run, with start/end;
-retries: model calls that were retried (SDK "Retrying ... raised X" lines and the app's 429 back-offs).
+retries: model calls that were retried (SDK "Retrying ... raised X" lines and the app's 429 back-offs);
+tools: one row per tool call (event "tool_call"): tool, status, hits, duration, query.
 """
 import json
 import re
@@ -30,7 +31,7 @@ def signature() -> tuple:
 
 
 def load() -> dict:
-    requests, steps, retries = [], [], []
+    requests, steps, retries, tools = [], [], [], []
     for f in log_files():
         for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
@@ -42,6 +43,8 @@ def load() -> dict:
                 requests.append(e)
             elif event == "step":
                 steps.append(e)
+            elif event == "tool_call":
+                tools.append(e)
             elif event == "model_backoff":
                 retries.append({"ts": e["ts"], "cause": "429 busy"})
             elif e.get("logger") == "google_genai._api_client" and (m := _RETRY.search(e.get("message", ""))):
@@ -63,7 +66,29 @@ def load() -> dict:
         stp["phase"] = stp["node"].map(PHASE_OF).fillna(PHASES[-1])
     rt = pd.DataFrame(retries, columns=["ts", "cause"])
     rt["ts"] = pd.to_datetime(rt["ts"], utc=True)
-    return {"requests": req, "steps": stp, "retries": rt}
+    tc = pd.DataFrame(tools, columns=["ts", "request_id", "tool", "status", "hits", "duration_ms", "query", "error"])
+    tc = tc.drop_duplicates(["request_id", "tool", "ts"])
+    tc["ts"] = pd.to_datetime(tc["ts"], utc=True)
+    return {"requests": req, "steps": stp, "retries": rt, "tools": tc}
+
+
+def tool_quality(calls: pd.DataFrame) -> pd.DataFrame:
+    """Per tool, from the per-call log lines: calls, share empty / error / not run (duplicate or over budget),
+    mean hits and p50 / p95 seconds of the calls that ran."""
+    if calls.empty:
+        return pd.DataFrame()
+    ran = calls[~calls["status"].isin(["duplicate", "budget"])]
+    rows = []
+    for tool, g in calls.groupby("tool"):
+        r = ran[ran["tool"] == tool]
+        secs = r["duration_ms"].dropna() / 1000
+        rows.append({"tool": tool, "calls": len(g), "empty": (g["status"] == "empty").mean(),
+                     "error": (g["status"] == "error").mean(),
+                     "not run": g["status"].isin(["duplicate", "budget"]).mean(),
+                     "mean hits": r["hits"].mean(),
+                     "p50 (s)": secs.quantile(0.5) if len(secs) else None,
+                     "p95 (s)": secs.quantile(0.95) if len(secs) else None})
+    return pd.DataFrame(rows).sort_values("calls", ascending=False)
 
 
 def phase_spans(req: pd.DataFrame, steps: pd.DataFrame) -> pd.DataFrame:

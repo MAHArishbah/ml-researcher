@@ -339,6 +339,22 @@ def _attempt_history(attempts: list) -> str:
     return text
 
 
+def _log_tool(name: str, args: dict, result, started: float | None = None) -> None:
+    """One 'tool_call' log line per tool call, so calls, queries, hits and time can be counted per tool.
+    Duplicate and over-budget calls (not run) are logged too, with no duration. request_id / thread_id are
+    added by the TurnIds log filter."""
+    status =result.get("status", "ok") if isinstance(result, dict) else "ok"
+    if status == "ok" and is_empty(result):
+        status = "empty"
+    hits = next((len(v) for v in result.values() if isinstance(v, list)), None) if isinstance(result, dict) else None
+    log.info("tool %s %s", name, status, extra={"json_fields": {
+        "event": "tool_call", "tool": name, "status": status, "hits": hits,
+        "duration_ms": round((time.monotonic() - started) * 1000) if started else None,
+        "query": str(args.get("query", args.get("task", "")))[:300],
+        "args": {k: v for k, v in args.items() if k not in ("query", "task", "context")},
+        "error": str(result.get("message"))[:300] if status == "error" else None}})
+
+
 def make_researcher(tool, source: str, report: str):
     name = tool.__name__
     llm = RESEARCH_LLM.bind_tools([tool])
@@ -366,13 +382,17 @@ def make_researcher(tool, source: str, report: str):
                 repeats += 1
                 result = {"status": "duplicate",
                           "message": f"Identical to an earlier call ({by_call[key]['outcome']}); not run again."}
+                _log_tool(tc["name"], tc["args"], result)
             elif len(attempts) >= MAX_TOOL_CALLS:                  # hard cap
                 result = {"status": "budget", "message": f"Tool budget of {MAX_TOOL_CALLS} calls used; not run."}
+                _log_tool(tc["name"], tc["args"], result)
             else:
+                t0 = time.monotonic()
                 try:
                     result = tool(**tc["args"])
                 except Exception as e:                             # bad arguments etc.
                     result = {"status": "error", "message": f"{type(e).__name__}: {e}"}
+                _log_tool(tc["name"], tc["args"], result, t0)
                 rkey = digest(result)
                 if rkey in by_result:                              # no progress: same output as before
                     repeats += 1
@@ -577,7 +597,10 @@ def after_review(state: ResearchState):
 
 def followup(task: dict) -> dict:
     if task["source"] == "python":
+        t0 = time.monotonic()
         (text, keys), urls, calls = python_check(task["query"], task["context"]), [], ["python_check"]
+        _log_tool("python_check", {"task": task["query"]},
+                  {"status": "error" if text.startswith("(no results") else "ok", "message": text[:300]}, t0)
     else:
         text, keys, urls, calls = run_researcher(SOURCES[task["source"]][0], task["topic"], task["query"])
     entry = {k: task[k] for k in ("source", "query", "reason", "key", "round")}
@@ -663,7 +686,9 @@ def _keep_from(messages: list, brief: str | None) -> int:
 def _summarise(previous: str | None, messages: list) -> str:
     convo = "\n\n".join(f"{'USER' if isinstance(m, HumanMessage) else 'ASSISTANT'}: {text_of(m)}" for m in messages)
     head = f"PREVIOUS SUMMARY:\n{previous}\n\nNEW MESSAGES:\n" if previous else ""
-    return text_of(LONG_LLM.invoke([SystemMessage(SUMMARY_PROMPT), HumanMessage(head + convo)]))
+    # runs inside the answer node, whose tokens the UI streams as the reply: "nostream" keeps it out of the stream
+    return text_of(LONG_LLM.invoke([SystemMessage(SUMMARY_PROMPT), HumanMessage(head + convo)],
+                                   config={"tags": ["nostream"]}))
 
 
 def answer(state: ResearchState) -> dict:

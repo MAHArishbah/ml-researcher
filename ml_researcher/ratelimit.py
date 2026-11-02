@@ -95,7 +95,8 @@ PACER = Pacer(LLM_RPS)
 
 
 def wait() -> None:
-    """Call before every direct google-genai request (LangChain models use PACER themselves)."""
+    """Call before every direct google-genai request (LangChain Gemini models pace each HTTP attempt through
+    llm._pace_request; other providers use PACER as LangChain's rate_limiter)."""
     PACER.acquire()
 
 

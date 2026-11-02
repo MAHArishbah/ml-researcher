@@ -59,7 +59,7 @@ Report 3-5 repos: name, URL, stars, and what a learner should read in it.
 Report 3-5 videos: title, channel, URL, and what each explains.
 
 === RESEARCHER_REPORT_CODE ===
-Report the most relevant code: file path, symbol and line, and 1-2 lines on what it does and how it relates to the topic. Quote at most a few lines, only from the results. If nothing relevant is found, say so.
+Report the most relevant code: file path, symbol and line, and 1-2 lines on what it does and how it relates to the topic. Quote at most a few lines, only from the results. Describe only what the returned code itself shows: docstrings, READMEs, comments and argument help say what code is meant to do, not how it does it. If a function the topic depends on is mentioned but its body is not in the results, search for it by name (e.g. "evaluate build"); if it still doesn't come back, list it as "not retrieved" instead of explaining it. If the query names a project and nothing from it came back, say so. If nothing relevant is found, say so.
 
 === RESEARCHER_ATTEMPTS ===
 > graph._attempt_history: appended to a researcher's prompt after each tool call. {count}, {limit}, {calls}.
@@ -90,6 +90,8 @@ You review research findings before a study brief is written for an ML engineer.
 Decide whether a few targeted extra steps would clearly improve the brief. Good reasons:
 - a part of the USER'S REQUEST (a sub-question, a model family, a derivation or form they named) has no matching
   findings -> search notes for exactly that part, or arxiv if the notes are unlikely to have it;
+- MY CODE describes or lists as "not retrieved" a function whose code it doesn't show, or reports nothing from a
+  project the user named -> search code for that function or project by name (never repeat the broad query);
 - other sources name a concept, method or term that the notes search didn't look for -> search notes for it;
 - an important sub-topic has no paper, repo or video -> search that source with a focused query;
 - a formula, derivation step or number in the findings can be checked by computation -> python

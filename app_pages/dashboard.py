@@ -43,7 +43,7 @@ with st.sidebar:
 @st.fragment(run_every="30s")
 def dashboard():
     d = data(log_data.signature())
-    req, steps, retries = d["requests"], d["steps"], d["retries"]
+    req, steps, retries, calls = d["requests"], d["steps"], d["retries"], d["tools"]
     st.title("Agent dashboard")
     if req.empty:
         st.info(f"No requests logged yet in {log_data.LOG_FILE}.")
@@ -162,6 +162,14 @@ def dashboard():
             tooltip=["tool:N", "calls:Q", alt.Tooltip("per_turn:Q", format=".2f"),
                      alt.Tooltip("turns_using:Q", format=".0%", title="share of turns using it")]
         ).properties(height=30 * len(tools) + 20), width="stretch")
+    quality = log_data.tool_quality(calls[calls["request_id"].isin(req["request_id"])])
+    if not quality.empty:
+        st.dataframe(quality, hide_index=True, width="stretch", column_config={
+            **{c: st.column_config.NumberColumn(format="percent") for c in ("empty", "error", "not run")},
+            **{c: st.column_config.NumberColumn(format="%.1f") for c in ("mean hits", "p50 (s)", "p95 (s)")}})
+        st.caption("From the per-call log (turns since tool logging started). empty = no results; not run = a "
+                   "repeated call or one over the 3-call budget. Time is the tool alone, without the researcher's "
+                   "model calls.")
 
     # ---- 6. one turn's timeline ----
     st.header("6. One turn's timeline")
@@ -199,6 +207,17 @@ def dashboard():
     st.altair_chart(chart.properties(height=alt.Step(30)), width="stretch")
     st.caption("Red dashed lines are retried model calls during this turn. A long grey bar is time spent "
                "waiting on a call that never finished.")
+    turn_calls = calls[calls["request_id"] == rid].sort_values("ts")
+    if not turn_calls.empty:
+        st.dataframe(pd.DataFrame({
+            "time": local(turn_calls["ts"]).dt.strftime("%H:%M:%S"), "tool": turn_calls["tool"],
+            "status": turn_calls["status"], "hits": turn_calls["hits"],
+            "seconds": turn_calls["duration_ms"] / 1000, "query": turn_calls["query"],
+            "error": turn_calls["error"].fillna("")}),
+            hide_index=True, width="stretch", column_config={
+                "seconds": st.column_config.NumberColumn(format="%.1f"),
+                "query": st.column_config.TextColumn(width="large")})
+        st.caption("Every tool call in this turn with the query the researcher sent, follow-ups included.")
 
 
 dashboard()

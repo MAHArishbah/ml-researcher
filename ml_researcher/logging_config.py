@@ -27,6 +27,23 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(entry, default=str, ensure_ascii=False)
 
 
+class TurnIds(logging.Filter):
+    """Tag every line logged during a turn (cache, guards, rerank, SDK retries ...) with that turn's request_id
+    and thread_id, read from the graph config runner.py starts the turn with. Lines logged outside a graph run
+    (ingest, eval, the UI) are left as they are; ids a line already carries are kept."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            from langgraph.config import get_config
+            conf = get_config().get("configurable", {})
+        except Exception:                            # outside a graph run (RuntimeError), or langgraph missing
+            return True
+        ids = {k: conf[k] for k in ("request_id", "thread_id") if conf.get(k)}
+        if ids:
+            record.json_fields = {**ids, **(getattr(record, "json_fields", None) or {})}
+        return True
+
+
 def setup_logging(app: str) -> logging.Logger:
     """Configure the 'ml_researcher' logger once per process; safe to call on every Streamlit rerun."""
     logger = logging.getLogger(LOGGER)
@@ -38,6 +55,7 @@ def setup_logging(app: str) -> logging.Logger:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10_000_000, backupCount=5, encoding="utf-8")
     file_handler.setFormatter(JsonFormatter())
+    file_handler.addFilter(TurnIds())
     logger.addHandler(file_handler)
 
     console = logging.StreamHandler(sys.stderr)
@@ -50,7 +68,9 @@ def setup_logging(app: str) -> logging.Logger:
             import google.cloud.logging
             from google.cloud.logging.handlers import CloudLoggingHandler
             client = google.cloud.logging.Client(project=PROJECT)
-            logger.addHandler(CloudLoggingHandler(client, name=LOG_NAME, labels={"app": app}))
+            cloud = CloudLoggingHandler(client, name=LOG_NAME, labels={"app": app})
+            cloud.addFilter(TurnIds())
+            logger.addHandler(cloud)
         except Exception as e:                       # never let logging break the app
             logger.warning("Cloud Logging disabled: %s", e)
 

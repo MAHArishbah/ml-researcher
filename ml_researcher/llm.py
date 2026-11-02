@@ -23,6 +23,12 @@ SERVER_DEADLINE = 600              # s: Google-side limit for a whole request (a
 FRESH_CONNECTIONS = httpx.Limits(keepalive_expiry=20)
 
 
+def _pace_request(request: httpx.Request) -> None:
+    """httpx request hook: every HTTP request the Google SDK sends waits for a pacer slot, including the SDK's
+    own retries (LangChain's rate_limiter would pace only the first attempt of each call)."""
+    PACER.acquire()
+
+
 def _provider_kwargs(provider: str, effort: str | None) -> dict:
     """Map one 'effort' knob (low|medium|high) onto each provider's own setting."""
     if provider == "google_genai":
@@ -31,7 +37,7 @@ def _provider_kwargs(provider: str, effort: str | None) -> dict:
         # still limits silence on the connection locally.
         kw = {"vertexai": True, "project": PROJECT, "location": LOCATION,
               "additional_headers": {"X-Server-Timeout": str(SERVER_DEADLINE)},
-              "client_args": {"limits": FRESH_CONNECTIONS}}
+              "client_args": {"limits": FRESH_CONNECTIONS, "event_hooks": {"request": [_pace_request]}}}
         return {**kw, "thinking_level": effort} if effort else kw
     if provider == "anthropic":
         kw = {"max_tokens": 16000}                         # briefs are long; the SDK default is small
@@ -42,9 +48,11 @@ def _provider_kwargs(provider: str, effort: str | None) -> dict:
 def chat_model(spec: str, effort: str | None = None, timeout: float = LLM_TIMEOUT) -> BaseChatModel:
     """spec = "provider:model". All models share one rate limiter and retry policy.
     timeout = longest silence on the connection (s); a call that gets no reply for that long is abandoned
-    and retried by the provider SDK (3 attempts in all), instead of hanging for minutes."""
+    and retried by the provider SDK (3 attempts in all), instead of hanging for minutes.
+    Gemini is paced per HTTP attempt by _pace_request, so it skips LangChain's per-call rate_limiter."""
     provider, name = spec.split(":", 1)
-    return init_chat_model(name, model_provider=provider, max_retries=3, rate_limiter=PACER, timeout=timeout,
+    limiter = None if provider == "google_genai" else PACER
+    return init_chat_model(name, model_provider=provider, max_retries=3, rate_limiter=limiter, timeout=timeout,
                            **_provider_kwargs(provider, effort))
 
 

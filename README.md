@@ -15,7 +15,11 @@ router ─> planner ──┼─> github_researcher  ─┼─> reviewer ─> sy
    └─> answer  (follow-ups: answered from the conversation, no search)
 ```
 
-After the first pass, a **reviewer** looks for gaps. For example, a video might use a term your notes weren't searched for, or a formula could be checked. It can then send follow-ups back to any source, or ask for a **Python check**. The brief gets a `## Checks` section when one runs. The review is optional: if its call fails (for example while Google is overloaded), the brief is written from the researchers' findings and `review_skipped` is logged, instead of the turn failing.
+After the first pass, a **reviewer** looks for gaps. For example, a video might use a term your notes weren't searched for, or a formula could be checked. It can then send follow-ups back to any source, or ask for a **Python check**. If the code findings describe a function without showing its code, or have nothing from a project you named, the follow-up searches for it by name; the code researcher itself may only explain code it actually got back, and lists the rest as "not retrieved". The brief gets a `## Checks` section when one runs. The review is optional: if its call fails (for example while Google is overloaded), the brief is written from the researchers' findings and `review_skipped` is logged, instead of the turn failing.
+
+**What each turn sees.** Every turn adds your message and the reply to the saved conversation, but only answer turns read it back:
+- **Research turns** don't send the history to the model. The router reads the last 4 messages to pick the route and write a one-sentence topic (so "now check my code for this" works); the planner, researchers, reviewer and brief writer see only that topic, your latest message and this turn's findings. A second research turn therefore doesn't see the first brief, and may repeat it.
+- **Answer turns** read the whole conversation, every brief included. Past `SUMMARY_TRIGGER_TOKENS` (30k), everything except the latest brief and the last 3 turns is replaced by a running summary. The summary is internal: it is never shown, and it is logged as `history_summary`.
 
 **When Google is slow or busy:**
 - **The router fails soft.** If the routing call gets no answer, the route is decided in code: `/web`, `/read` or a mention of your notes or code → research; an earlier brief in the conversation → answer; otherwise → research. This is logged as `router_fallback`, and the UI says so.
@@ -82,6 +86,7 @@ GOOGLE_CLOUD_LOCATION=global
 MAIN_MODEL=google_genai:gemini-3.8-flash          # router, planner, reviewer, synthesizer, answers
                                                   # (gemini-3.7-flash if 3.8 drops requests: see Troubleshooting)
 RESEARCHER_MODEL=google_genai:gemini-3.5-flash-lite   # the 5 researchers + image captions
+                                                      # (gemini-3.5-flash follows the report formats more reliably)
 # Claude instead: MAIN_MODEL=anthropic:claude-sonnet-5-5 and ANTHROPIC_API_KEY=...  (embeddings stay on Gemini)
 EMBED_MODEL=gemini-embedding-2
 EMBED_DIM=768
@@ -111,9 +116,9 @@ LOG_TO_GCP=true                          # optional, see Monitoring
 | `CODE_DIRS` | `/mnt/e/AI_ML/Prac` | folders of your own code for the code index (comma-separated) |
 | `WEB_SEARCH` | `true` | allow `/web` questions (Gemini Google Search, Gemini models only, strict guardrails) |
 | `CODE_SANDBOX` | `auto` | hosted Python for checks: `auto` uses `MAIN_MODEL`'s provider; `none` switches checks off |
-| `LLM_RPS` | `5` | maximum model calls per second, spaced evenly: per process (chat, UI) **and combined across all processes** (UI + daily ingest + eval), coordinated through `~/.ml_researcher/pacer.slot`; `0` means no limit (`GEMINI_RPS` still works) |
+| `LLM_RPS` | `5` | maximum model calls per second, spaced evenly: per process (chat, UI) **and combined across all processes** (UI + daily ingest + eval), coordinated through `~/.ml_researcher/pacer.slot`. Every HTTP request to Google waits for a slot, including the SDK's own retries; `0` means no limit (`GEMINI_RPS` still works) |
 | `BATCH_RPS` | `1` | stricter pace that `ingest` and `evaluate` switch to, for long runs |
-| `SUMMARY_TRIGGER_TOKENS` | `30000` | follow-ups: once a conversation is this long, older turns are summarised; the latest brief and the last 3 turns stay word for word |
+| `SUMMARY_TRIGGER_TOKENS` | `30000` | answer turns only: once a conversation is this long, older turns are summarised; the latest brief and the last 3 turns stay word for word |
 | `REPLY_TIMEOUT` | `90` | silence limit for the answer and synthesizer (they reason silently for 30–60 s before the first token) |
 | `LLM_TIMEOUT`, `FAST_LLM_TIMEOUT`, `SANDBOX_TIMEOUT` | `90`, `45`, `180` | seconds of silence on a model connection before the call is cut and retried (same model, 3 attempts in all). Answers that keep streaming are never cut; Google's own deadline for a whole request is 600 s |
 | `CHECKPOINT_DB` | `~/.ml_researcher/checkpoints.sqlite` | saved conversations |
@@ -194,7 +199,7 @@ A fifth researcher searches it (`search_my_code`), and briefs gain a `## My code
 streamlit run ui.py
 ```
 
-- Conversations are saved; switch between them or start new ones from the sidebar. **☆ Star** moves the current conversation to a separate **★ Starred** picker (and out of **Conversations**); **★ Starred** moves it back. Stars are kept in a `starred` table in `checkpoints.sqlite`.
+- Conversations are saved; switch between them or start new ones from the sidebar. A conversation's name is its id (`thread_id` in the logs), so **Start** with an existing name reopens that conversation instead of making a new one. **☆ Star** moves the current conversation to a separate **★ Starred** picker (and out of **Conversations**); **★ Starred** moves it back. Stars are kept in a `starred` table in `checkpoints.sqlite`.
 - Replies stream in as they're written, with LaTeX rendered.
 - **⏹ Stop** cancels a reply mid-way and puts your prompt back in the box to edit. A turn that **fails** (for example after every retry timed out) is undone the same way: the conversation is left unchanged, the error is shown, and your question is back in the box to resend.
 - **Copy** under every prompt and reply opens its raw text (markdown and LaTeX source) with a copy icon.
@@ -222,13 +227,22 @@ The planner, reviewer and brief writer see your full message, not just the route
 
 Every turn writes JSON log lines to `~/.ml_researcher/logs/agent.jsonl`:
 - one `step` event per graph node
+- one `tool_call` event per tool call: tool, status (ok, empty, error, duplicate, budget), hits, duration and the query sent, tagged with the turn's `request_id`
 - one `request` event per turn, with status, error code, route, turn number, main and researcher model, latency, time to first token (TTFT), time per output token (TPOT) and token counts
 
-Indexing also writes an `ingest_file` event per file. To summarize the local log:
+Every other line written during a turn (cache, guards, rerank, SDK retries, ...) carries the same `request_id` and `thread_id` (the conversation), so `grep '"request_id": "<id>"'` shows a whole turn. Indexing also writes an `ingest_file` event per file. To summarize the local log:
 
 ```bash
 python -m ml_researcher.log_report --last 200    # p50 / p95 per metric and per step
+grep '"event": "tool_call"' ~/.ml_researcher/logs/agent.jsonl | grep search_my_code | tail   # one tool's calls
+grep '"request_id": "<id>"' ~/.ml_researcher/logs/agent.jsonl                                # everything in one turn
+grep '"event": "request"' ~/.ml_researcher/logs/agent.jsonl | tail -1 | grep -o '"request_id": "[^"]*"'   # id of the last finished turn
+grep '"thread_id": "RAG"' ~/.ml_researcher/logs/agent.jsonl                                  # one conversation
 ```
+
+Fields are written as `"key": "value"`, with a space after the colon; a pattern without the space matches nothing. Each turn has its own `request_id`, so a follow-up never shares one with the turn before it.
+
+Warnings worth grepping for (`"event": "..."`): `router_fallback`, `review_skipped`, `model_backoff`, `cache_error`, `rerank_error`, `url_read_failed`, `article_condense_failed`, `injection_suspect`, `url_removed` (a link no tool returned was stripped from a reply) and `code_redacted`. SDK retries have no event field: `grep Retrying`.
 
 **Local dashboard.** The **Dashboard** page in the web UI's sidebar reads the same log and refreshes every 30 s. It doesn't repeat the Cloud dashboard's p50/p95 trends; it breaks them down instead:
 
@@ -238,8 +252,8 @@ python -m ml_researcher.log_report --last 200    # p50 / p95 per metric and per 
 | 2. Where the time goes | the last 15 turns as bars split into wall-clock phases: route, plan, research (parallel), review, write, unfinished / waiting |
 | 3. Reliability | retried model calls per hour by cause (ReadTimeout, ConnectError, 429), which never reach Cloud Logging; failed and stopped turns with the step that failed |
 | 4. Context growth | input tokens turn by turn for the 8 most recently active conversations |
-| 5. Tool mix | calls per research turn for each tool, and the share of turns that use it |
-| 6. One turn's timeline | a chosen turn's steps on a time axis, with retried calls marked and any time stuck in an unfinished call |
+| 5. Tool mix | calls per research turn for each tool, and the share of turns that use it; per tool, the share of calls that came back empty, failed or weren't run, mean hits, and p50 / p95 time of the tool alone |
+| 6. One turn's timeline | a chosen turn's steps on a time axis, with retried calls marked and any time stuck in an unfinished call; below it, every tool call in the turn with its query, status, hits and time |
 
 Filters in the sidebar: time range, route and main model. Turns logged before the model field existed show as "not logged". Times are in `DASHBOARD_TZ` (default UTC; e.g. `Asia/Kolkata`).
 
@@ -399,7 +413,7 @@ ruff format --diff .  # preview formatting changes (ruff format . applies them)
 
 | Path | What it does |
 |---|---|
-| `ml_researcher/llm.py` | chat models: `chat_model("provider:model", effort)` for Gemini (Vertex AI) or Claude; one `effort` setting mapped to each provider; silence timeouts, retries, idle connections closed after 20 s |
+| `ml_researcher/llm.py` | chat models: `chat_model("provider:model", effort)` for Gemini (Vertex AI) or Claude; one `effort` setting mapped to each provider; silence timeouts, retries, idle connections closed after 20 s, every Gemini HTTP attempt (retries too) paced through an httpx request hook |
 | `ml_researcher/sandbox.py` | `CodeSandbox` interface for Python checks: Gemini or Claude **hosted** code execution, or none; code never runs locally |
 | `ml_researcher/cache.py` | prompt caching per provider: Gemini explicit caches (only above Vertex's 4,096-token minimum) or Claude `cache_control` breakpoints |
 | `ml_researcher/ratelimit.py` | pacing for every model call: each process's own pace (`LLM_RPS`, or `BATCH_RPS` for batch jobs) plus one combined limit across all processes (a file-locked shared timeline) |

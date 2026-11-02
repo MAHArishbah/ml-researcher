@@ -46,8 +46,8 @@ def run_turn(graph, thread_id: str, prompt: str,
     should_stop() is polled on every stream event; True aborts the turn with TurnCancelled.
     on_notice(message) receives status messages from inside the graph (e.g. "Google is busy, retrying in 30 s").
     Returns the final reply text; re-raises any error after logging it."""
-    cfg = {"configurable": {"thread_id": thread_id}}
     ids = {"request_id": uuid.uuid4().hex[:12], "thread_id": thread_id}
+    cfg = {"configurable": ids}                      # request_id also reaches the per-tool-call log lines
     t0 = time.monotonic()
     started, steps = {}, []
     text, t_first, t_last = "", None, None
