@@ -9,8 +9,8 @@ import streamlit as st
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from ml_researcher import vectordb
-from ml_researcher.config import CHECKPOINT_DB
+from ml_researcher import conversations, memory, vectordb
+from ml_researcher.config import CHECKPOINT_DB, private_dir
 from ml_researcher.graph import build_graph
 from ml_researcher.llm import text_of
 from ml_researcher.logging_config import setup_logging
@@ -62,10 +62,17 @@ class StoppableSaver(SqliteSaver):
 @st.cache_resource
 def backend():
     """One SQLite saver + compiled graph shared by all browser sessions."""
-    CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
+    private_dir(CHECKPOINT_DB.parent)
     saver = SqliteSaver(sqlite3.connect(str(CHECKPOINT_DB), check_same_thread=False))
     saver.lock = threading.RLock()           # re-entrant: StoppableSaver holds it around super().put
     return saver, build_graph(checkpointer=saver)
+
+
+@st.cache_resource
+def running() -> dict:
+    """Conversations with a turn in progress, shared by every tab and session of this app. Two turns on one
+    conversation both start from the same checkpoint and the later save drops the other's reply."""
+    return {"threads": set(), "lock": threading.Lock()}
 
 
 def list_threads(saver) -> list:
@@ -99,6 +106,28 @@ def pick_thread(key: str):
     """A conversation picker changed: make its choice the current conversation."""
     if st.session_state.get(key):
         st.session_state.thread = st.session_state[key]
+
+
+def pick_conversation(thread_id: str):
+    st.session_state.thread = thread_id
+
+
+def open_hit(thread_id: str, idx: int):
+    """A search result was clicked: open its conversation and scroll to that message."""
+    st.session_state.thread = thread_id
+    st.session_state.focus = (thread_id, idx)
+
+
+# scrolls the message marked by an anchor into view (st.html scripts run in the app's page or its frame)
+SCROLL_TO_HIT_JS = """
+<script>
+setTimeout(() => {
+  const d = window.parent && window.parent.document ? window.parent.document : document;
+  const hit = d.getElementById("search-hit");
+  if (hit) hit.scrollIntoView({behavior: "smooth", block: "start"});
+}, 400);
+</script>
+"""
 
 
 def run_in_background(turn_graph, thread_id: str, prompt: str, stop: threading.Event,
@@ -159,6 +188,81 @@ PROMPT_HISTORY_JS = """
 """
 
 
+# left-aligned, row-like result buttons inside the search dialog (Streamlit centres button labels by default)
+SEARCH_CSS = """
+<style>
+div[role="dialog"] [data-testid="stBaseButton-tertiary"] { justify-content: flex-start; width: 100%;
+  padding: 0.35rem 0.5rem; border-radius: 0.5rem; }
+div[role="dialog"] [data-testid="stBaseButton-tertiary"] p { text-align: left; }
+div[role="dialog"] [data-testid="stBaseButton-tertiary"]:hover { background: rgba(127, 127, 127, 0.15); }
+</style>
+"""
+
+
+@st.dialog("Search", width="large")
+def search_dialog():
+    """Ctrl+K palette: recent conversations while the box is empty; message hits, grouped by conversation,
+    as you type. Clicking a row opens it (scrolled to the message); Esc closes."""
+    st.html(SEARCH_CSS)
+    query = st.text_input("Search", key="search_q", live=True, label_visibility="collapsed",
+                          placeholder='Search messages: words, "a phrase", prefix*')
+    scope = st.segmented_control("Scope", ["All conversations", "This conversation"], key="search_scope",
+                                 default="All conversations", label_visibility="collapsed")
+    if not query.strip():
+        st.caption("Recents")
+        for t in threads[:8]:
+            if st.button(t, key=f"recent_{t}", type="tertiary", icon=":material/chat_bubble:",
+                         on_click=pick_conversation, args=(t,)):
+                st.rerun()                           # closes the dialog
+        return
+    with saver.lock:
+        conversations.sync(saver.conn, graph)        # re-indexes only conversations changed since last time
+        hits = conversations.search(saver.conn, graph, query,
+                                    st.session_state.thread if scope == "This conversation" else None)
+    if not hits:
+        st.caption("No matching messages.")
+    by_convo = {}                                    # best-ranked conversation first, its hits in rank order
+    for h in hits:
+        by_convo.setdefault(h["thread_id"], []).append(h)
+    for t, group in by_convo.items():
+        st.caption(f"{t} · {len(group)} match{'es' if len(group) > 1 else ''}")
+        for h in group:
+            label = h["snippet"].replace("\n", " ").replace("$", "\\$")      # raw text: no half-cut LaTeX
+            icon = ":material/person:" if h["role"] == "user" else ":material/smart_toy:"
+            if st.button(label, key=f"hit_{t}_{h['idx']}", type="tertiary", icon=icon, wrap=True,
+                         help=f"{'Your question' if h['role'] == 'user' else 'Reply'} #{h['idx'] + 1} in {t}",
+                         on_click=open_hit, args=(t, h["idx"])):
+                st.rerun()                           # closes the dialog; the callback already opened the hit
+    st.caption("Esc to close")
+
+
+def memory_panel():
+    """Sidebar view of long-term memory: every profile fact and memory, each deletable."""
+    with st.expander("🧠 Memory"):
+        st.caption("Add **/memory** to a message to use it; **/remember** <fact> or **/remember** key: value to "
+                   "add to it. Memories are also learned from every finished turn.")
+        try:
+            facts, memories = memory.profile(), memory.all_memories()
+        except Exception as e:
+            st.caption(f"memory unavailable: {e}")
+            return
+        for k, v in facts.items():
+            left, right = st.columns([6, 1])
+            left.markdown(f"**{k}:** {v}")
+            right.button("✕", key=f"del_fact_{k}", type="tertiary", help="Delete this profile fact",
+                         on_click=memory.set_profile, args=(k, None))
+        if not facts and not memories:
+            st.caption("Nothing remembered yet.")
+        for m in memories[:50]:
+            left, right = st.columns([6, 1])
+            left.markdown(f"{m['text']}  \n<small>{m['kind']} · importance {m['importance']}</small>",
+                          unsafe_allow_html=True)
+            right.button("✕", key=f"del_mem_{m['id']}", type="tertiary", help="Forget this memory",
+                         on_click=memory.delete, args=(m["id"],))
+        if len(memories) > 50:
+            st.caption(f"… and {len(memories) - 50} older memories")
+
+
 def stop_and_edit():
     """Stop button callback (runs at the start of the next script run): put the prompt back for editing."""
     st.session_state.chat_box = st.session_state.get("pending_prompt", "")
@@ -175,7 +279,17 @@ def roll_back(stop: threading.Event, pre_turn, thread_id: str):
             saver.delete_thread(thread_id)
 
 
+@st.cache_resource
+def prune_at_start() -> int:
+    """Once per app process: drop the checkpoint history of every idle conversation (only its latest state is
+    ever shown). Conversations saved in the last few minutes are skipped: a terminal-chat turn may be running."""
+    with saver.lock:
+        return conversations.prune(saver.conn, conversations.idle_threads(saver.conn, graph, set()))
+
+
 saver, graph = backend()
+prune_at_start()
+reg = running()
 threads = list_threads(saver)
 if "thread" not in st.session_state:
     st.session_state.thread = threads[0] if threads else "default"
@@ -204,6 +318,22 @@ with st.sidebar:
                  help="Unstar this conversation" if is_starred else "Star this conversation: it moves to the top"):
         set_star(saver, st.session_state.thread, not is_starred)
         st.rerun()
+    with reg["lock"]:
+        busy_here = st.session_state.thread in reg["threads"]
+    if st.session_state.thread in threads:
+        with st.popover("🗑 Delete conversation", type="tertiary", disabled=busy_here):
+            st.write(f"Delete **{st.session_state.thread}**: its messages, search entries and star. "
+                     "This can't be undone.")
+            if st.button("Delete for good", type="primary", key="delete_confirm"):
+                with saver.lock:
+                    conversations.forget(saver.conn, saver, st.session_state.thread)
+                memory.forget_thread(st.session_state.thread)          # and what was learned from it
+                remaining = list_threads(saver)
+                st.session_state.thread = remaining[0] if remaining else "default"
+                st.rerun()
+    if st.button("Search", icon=":material/search:", key="open_search", type="tertiary", shortcut="Ctrl+K",
+                 help="Search every message in every conversation (Ctrl+K)"):
+        search_dialog()
     try:
         st.caption(f"{vectordb.count():,} chunks indexed")
     except Exception as e:
@@ -224,14 +354,46 @@ with st.sidebar:
             if values.get(key):
                 with st.expander(f"Raw findings: {label}"):
                     st.markdown(to_streamlit_md(values[key]))
+    if values.get("memory_used"):
+        with st.expander("Memories used in the last turn"):
+            for m in values["memory_used"]:
+                st.markdown(f"- {m['text']}  \n  <small>score {m['score']}</small>", unsafe_allow_html=True)
+    memory_panel()
 
 # ---------- chat ----------
 st.subheader(f"Conversation: {st.session_state.thread}")
 messages = values.get("messages", [])
+focus = st.session_state.pop("focus", None)                     # (thread, position) of a clicked search hit
 for n, m in enumerate(messages):
     with st.chat_message("user" if isinstance(m, HumanMessage) else "assistant"):
+        if focus == (st.session_state.thread, n):
+            st.html('<div id="search-hit"></div>')
+            st.caption("🔎 Search result")
         st.markdown(to_streamlit_md(text_of(m)))
         copy_button(text_of(m), key=f"copy_{st.session_state.thread}_{n}")
+if focus and focus[0] == st.session_state.thread:
+    st.html(SCROLL_TO_HIT_JS, unsafe_allow_javascript=True)
+
+gaps = [] if busy_here else conversations.unanswered(messages)
+if busy_here:
+    st.info("A turn is running for this conversation in another tab. Wait for it to finish before asking here.")
+elif gaps:
+    st.warning(f"{len(gaps)} question(s) here never got an answer: a turn that ended without being undone "
+               "(the app restarted mid-turn, or two turns ran at once). Removing them keeps the conversation "
+               "clean; a question left at the end goes back in the box.")
+    if st.button("Remove unanswered questions", key="drop_gaps"):
+        last = text_of(messages[-1]) if gaps[-1] == len(messages) - 1 else None
+        with saver.lock:
+            conversations.remove_messages(graph, config, gaps)
+            conversations.prune(saver.conn, [st.session_state.thread])
+        if last is not None:
+            st.session_state.restore_prompt = last
+        st.rerun()
+if note := st.session_state.pop("memory_note", None):     # set by /remember just before its rerun
+    st.success(note)
+if st.session_state.pop("turn_refused", False):
+    st.warning("Not sent: a turn for this conversation is already running in another tab. "
+               "Your question is back in the box.")
 
 if messages and not isinstance(messages[-1], HumanMessage):
     st.download_button("Download last reply (.md)", text_of(messages[-1]),
@@ -246,7 +408,8 @@ if (restore := st.session_state.pop("restore_prompt", None)) is not None:
 past_prompts = [text_of(m) for m in messages if isinstance(m, HumanMessage)]
 st.html(PROMPT_HISTORY_JS % json.dumps(past_prompts).replace("</", "<\\/"), unsafe_allow_javascript=True)
 
-if prompt := st.chat_input("Ask about an ML topic, or follow up on a brief", key="chat_box"):
+def chat_turn(prompt: str):
+    """Run one turn in a worker thread, streaming its steps and reply; undo it if it fails or is stopped."""
     st.session_state.pending_prompt = prompt
     with st.chat_message("user"):
         st.markdown(to_streamlit_md(prompt))
@@ -303,4 +466,25 @@ if prompt := st.chat_input("Ask about an ML topic, or follow up on a brief", key
             st.session_state.restore_prompt = prompt
             st.rerun()
         reply.markdown(to_streamlit_md(final))
+        with saver.lock:                     # the turn is saved: its step-by-step history isn't needed any more
+            conversations.prune(saver.conn, [st.session_state.thread])
     st.rerun()                               # redraw history + sidebar from the saved state
+
+
+if prompt := st.chat_input("Ask about an ML topic, or follow up on a brief", key="chat_box"):
+    if (note := memory.command(prompt)) is not None:      # /remember: stored, not sent as a turn
+        st.session_state.memory_note = note
+        st.rerun()
+    thread = st.session_state.thread
+    with reg["lock"]:                        # one turn per conversation at a time, across tabs and sessions
+        refused = thread in reg["threads"]
+        reg["threads"].add(thread)
+    if refused:
+        st.session_state.turn_refused = True
+        st.session_state.restore_prompt = prompt
+        st.rerun()
+    try:
+        chat_turn(prompt)
+    finally:                                 # done, failed, stopped or tab closed: the conversation is free again
+        with reg["lock"]:
+            reg["threads"].discard(thread)

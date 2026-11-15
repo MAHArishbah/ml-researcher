@@ -4,7 +4,8 @@ import sqlite3
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from .config import CHECKPOINT_DB
+from . import memory
+from .config import CHECKPOINT_DB, private_dir
 from .graph import build_graph
 from .logging_config import setup_logging
 from .runner import run_turn
@@ -16,11 +17,11 @@ def main():
     args = ap.parse_args()
     setup_logging(app="chat")
 
-    CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
+    private_dir(CHECKPOINT_DB.parent)
     conn = sqlite3.connect(str(CHECKPOINT_DB), check_same_thread=False)
     graph = build_graph(checkpointer=SqliteSaver(conn))
     config = {"configurable": {"thread_id": args.thread}}
-    print(f"thread '{args.thread}'  |  commands: /state  /graph  /quit")
+    print(f"thread '{args.thread}'  |  commands: /state  /graph  /remember <fact>  /quit  (add /memory to a message)")
     try:
         while True:
             try:
@@ -39,14 +40,20 @@ def main():
                 print({k: (v if k in ("route", "topic", "search_plan") else f"<{len(str(v))} chars>")
                     for k, v in vals.items()})
                 continue
-            printed = 0
+            if (note := memory.command(text)) is not None:      # /remember: stored, not sent as a turn
+                print(f"  {note}")
+                continue
+            printed, shown = 0, ""
 
             def on_token(so_far: str):
-                nonlocal printed
+                nonlocal printed, shown
+                if not so_far.startswith(shown):          # a retried reply call: the text starts over
+                    print("\n  (retried: the reply starts over)")
+                    printed = 0
                 if not printed:
                     print("\nassistant>")
                 print(so_far[printed:], end="", flush=True)   # print only the new part
-                printed = len(so_far)
+                printed, shown = len(so_far), so_far
 
             try:
                 run_turn(graph, args.thread, text,

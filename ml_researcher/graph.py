@@ -35,7 +35,7 @@ from langgraph.types import Send
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
-from . import cache, urlreader, websearch
+from . import cache, memory, urlreader, websearch
 from .config import MAIN_MODEL, SUMMARY_TRIGGER_TOKENS
 from .guards import (action_key, call_key, digest, filter_urls, find_urls, is_empty, outcome, source_urls,
                      suspicious)
@@ -100,6 +100,8 @@ class ResearchState(TypedDict, total=False):
     read_url: str                             # this turn's /read URL ("" if none)
     page_url: str                             # where that URL finally landed (after safe redirects)
     page_findings: str                        # the article's text (untrusted data), or why it couldn't be read
+    memory_context: str                       # /memory turns: profile + recalled memories, as a prompt block
+    memory_used: list                         # the memories recalled this turn: id, text, score (for the UI)
 
 
 # ---------- structured outputs ----------
@@ -159,6 +161,7 @@ def router(state: ResearchState) -> dict:
     web = bool(re.search(r"(?<!\S)/web(?!\S)", message, re.IGNORECASE))   # the /web command, anywhere; opt-in only
     read = urlreader.parse_read(message)                        # "/read <url> question": explicit opt-in only
     own = bool(_POINTS_AT_OWN.search(message))                  # "it's in my notes" -> must search them
+    recalled = _recall(message) if _MEMORY_CMD.search(message) else ("", [])   # /memory: opt-in, once per turn
     try:
         d = structured(FAST_LLM, Route).invoke(
             [SystemMessage(prompt("ROUTER", topic=state.get("topic") or "none yet"))]
@@ -171,7 +174,24 @@ def router(state: ResearchState) -> dict:
             "event": "router_fallback", "route": action, "error": f"{type(e).__name__}: {str(e)[:200]}"}})
         _notice(f"Routing call failed; continuing with {action}")
     return {"route": "research" if (web or read or own) else action, "topic": topic or message[:200], "web": web,
-            "read_url": read[0] if read else ""}
+            "read_url": read[0] if read else "", "memory_context": recalled[0], "memory_used": recalled[1]}
+
+
+_MEMORY_CMD = re.compile(r"(?<!\S)/memory(?!\S)", re.IGNORECASE)
+
+
+def _recall(message: str) -> tuple[str, list]:
+    """/memory: the profile + the most useful memories for this message. Fails soft: without them the turn
+    simply runs as if /memory hadn't been typed."""
+    try:
+        block, used = memory.context(_MEMORY_CMD.sub(" ", message))
+    except Exception as e:
+        log.warning("memory recall failed: %s", e, extra={"json_fields": {
+            "event": "memory_error", "error": f"{type(e).__name__}: {str(e)[:200]}"}})
+        _notice("Memory recall failed; continuing without it")
+        return "", []
+    _flag("memory", block)
+    return block, used
 
 
 def web_researcher(state: ResearchState) -> dict:
@@ -531,6 +551,8 @@ def _stop_reason(state: ResearchState, rnd: int, log: list) -> str:
 def _first_pass(state: ResearchState) -> str:
     """The 5 researchers' findings: fixed for the rest of the turn, so it is the cached prefix."""
     parts = [f"TOPIC: {state['topic']}", f"USER'S REQUEST (answer every part of it):\n{_request(state)}"]
+    if state.get("memory_context"):                  # only on /memory turns
+        parts.append(state["memory_context"])
     parts += [f"{label}:\n<findings>\n{(state.get(key) or '')[:FINDINGS_LIMIT]}\n</findings>" for label, key in
               (("PAPERS", "arxiv_findings"), ("MY NOTES", "local_findings"), ("MY CODE", "code_findings"),
                ("GITHUB REPOS", "github_findings"), ("VIDEOS", "youtube_findings"))]
@@ -698,6 +720,8 @@ def answer(state: ResearchState) -> dict:
     KEEP_TURNS turns stay word for word. The part up to the latest brief is cached for the next follow-ups."""
     messages, brief = state["messages"], state.get("brief")
     system, update = ANSWER_PROMPT, {}
+    if state.get("memory_context"):                  # only on /memory turns
+        system = f"{ANSWER_PROMPT}\n\n{state['memory_context']}"
     start = _keep_from(messages, brief)
     if start > 0 and _tokens(messages) > SUMMARY_TRIGGER_TOKENS:
         summary, upto = state.get("history_summary"), state.get("summary_upto", 0)
@@ -707,7 +731,7 @@ def answer(state: ResearchState) -> dict:
             log.info("history summarised", extra={"json_fields": {
                 "event": "history_summary", "messages_summarised": start, "tokens_before": _tokens(messages),
                 "tokens_after": _tokens(messages[start:]) + len(summary) // 4}})
-        system = f"{ANSWER_PROMPT}\n\nSUMMARY OF THE EARLIER CONVERSATION:\n{summary}"
+        system = f"{system}\n\nSUMMARY OF THE EARLIER CONVERSATION:\n{summary}"
         messages = messages[start:]
     cut = max((i for i, m in enumerate(messages) if brief and isinstance(m, AIMessage) and text_of(m) == brief),
               default=-1)

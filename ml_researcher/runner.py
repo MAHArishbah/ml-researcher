@@ -5,6 +5,7 @@ latency, TTFT (time to first reply token), TPOT (time per output token after the
 token usage, route, turn number and status / error_code.
 """
 import logging
+import threading
 import time
 import uuid
 from collections import Counter
@@ -12,7 +13,8 @@ from typing import Callable, Optional
 
 from langchain_core.messages import AIMessageChunk, HumanMessage
 
-from .config import LOG_PROMPTS, MAIN_MODEL, RESEARCHER_MODEL
+from . import memory
+from .config import LOG_PROMPTS, MAIN_MODEL, MEMORY_AUTO, RESEARCHER_MODEL
 from .llm import text_of
 
 log = logging.getLogger("ml_researcher.requests")
@@ -50,7 +52,7 @@ def run_turn(graph, thread_id: str, prompt: str,
     cfg = {"configurable": ids}                      # request_id also reaches the per-tool-call log lines
     t0 = time.monotonic()
     started, steps = {}, []
-    text, t_first, t_last = "", None, None
+    text, t_first, t_last, reply_run = "", None, None, None
     reply_tokens, usage = 0, {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0,
                                 "reasoning_tokens": 0}
     status, error_code, error = "ok", None, None
@@ -100,6 +102,10 @@ def run_turn(graph, thread_id: str, prompt: str,
             usage["reasoning_tokens"] += reasoning
             if meta.get("langgraph_node") not in REPLY_NODES:
                 continue
+            if chunk.id and chunk.id != reply_run:   # a new model call: the reply (or a retry of it) starts over,
+                if reply_run is not None:            # so drop what a failed earlier attempt had streamed
+                    text, reply_tokens = "", 0
+                reply_run = chunk.id
             reply_tokens += u.get("output_tokens", 0) - reasoning   # visible tokens only
             piece = _chunk_text(chunk)
             if piece:
@@ -137,4 +143,7 @@ def run_turn(graph, thread_id: str, prompt: str,
         log.log(logging.ERROR if status == "error" else logging.INFO,
                 "request %s %s %sms", status, fields["route"], fields["latency_ms"],
                 extra={"json_fields": fields})
-    return text_of(values["messages"][-1])
+    reply = text_of(values["messages"][-1])
+    if MEMORY_AUTO:                                  # long-term memory: mined after the reply, off the critical path
+        threading.Thread(target=memory.after_turn, args=(prompt, reply, thread_id), daemon=True).start()
+    return reply

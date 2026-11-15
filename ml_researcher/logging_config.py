@@ -9,7 +9,7 @@ import sys
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
-from .config import LOG_DIR, LOG_LEVEL, LOG_NAME, LOG_TO_GCP, PROJECT
+from .config import LOG_DIR, LOG_LEVEL, LOG_NAME, LOG_TO_GCP, PROJECT, DATA_DIR, private_dir
 
 LOGGER = "ml_researcher"
 LOG_FILE = LOG_DIR / "agent.jsonl"
@@ -52,7 +52,8 @@ def setup_logging(app: str) -> logging.Logger:
     logger.setLevel(LOG_LEVEL)
     logger.propagate = False                         # don't duplicate into Streamlit's/root handlers
 
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    private_dir(DATA_DIR)
+    private_dir(LOG_DIR)
     file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10_000_000, backupCount=5, encoding="utf-8")
     file_handler.setFormatter(JsonFormatter())
     file_handler.addFilter(TurnIds())

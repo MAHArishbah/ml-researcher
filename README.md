@@ -118,6 +118,11 @@ LOG_TO_GCP=true                          # optional, see Monitoring
 | `CODE_SANDBOX` | `auto` | hosted Python for checks: `auto` uses `MAIN_MODEL`'s provider; `none` switches checks off |
 | `LLM_RPS` | `5` | maximum model calls per second, spaced evenly: per process (chat, UI) **and combined across all processes** (UI + daily ingest + eval), coordinated through `~/.ml_researcher/pacer.slot`. Every HTTP request to Google waits for a slot, including the SDK's own retries; `0` means no limit (`GEMINI_RPS` still works) |
 | `BATCH_RPS` | `1` | stricter pace that `ingest` and `evaluate` switch to, for long runs |
+| `MEMORY_AUTO` | `true` | learn memories from every finished turn (one researcher-model call each, in the background) |
+| `MEMORY_TOP_K`, `MEMORY_CANDIDATES` | `8`, `200` | memories recalled per `/memory` turn; nearest memories scored per recall |
+| `MEMORY_DECAY`, `MEMORY_WEIGHTS` | `0.995`, `1,1,1` | recency = decay ^ hours since last use; weights of recency, importance, relevance |
+| `MEMORY_REFLECT_AT` | `150` | importance written since the last reflection that triggers a new one |
+| `MEMORY_FILE` | `~/.ml_researcher/memory.json` | the key-value profile |
 | `SUMMARY_TRIGGER_TOKENS` | `30000` | answer turns only: once a conversation is this long, older turns are summarised; the latest brief and the last 3 turns stay word for word |
 | `REPLY_TIMEOUT` | `90` | silence limit for the answer and synthesizer (they reason silently for 30–60 s before the first token) |
 | `LLM_TIMEOUT`, `FAST_LLM_TIMEOUT`, `SANDBOX_TIMEOUT` | `90`, `45`, `180` | seconds of silence on a model connection before the call is cut and retried (same model, 3 attempts in all). Answers that keep streaming are never cut; Google's own deadline for a whole request is 600 s |
@@ -200,8 +205,13 @@ streamlit run ui.py
 ```
 
 - Conversations are saved; switch between them or start new ones from the sidebar. A conversation's name is its id (`thread_id` in the logs), so **Start** with an existing name reopens that conversation instead of making a new one. **☆ Star** moves the current conversation to a separate **★ Starred** picker (and out of **Conversations**); **★ Starred** moves it back. Stars are kept in a `starred` table in `checkpoints.sqlite`.
-- Replies stream in as they're written, with LaTeX rendered.
+- **🔍 Search** (sidebar, or **Ctrl+K**) opens a search palette over the page. While the box is empty it lists recent conversations; as you type, it searches every message of every conversation (or only the current one), grouped by conversation, with the matching words in bold and an icon for your question or a reply. Plain words match word stems (*batch* finds *batching*); `"exact phrases"` and `prefix*` work too. Click a result to open that conversation scrolled to the message; Esc closes the palette. The index is a contentless SQLite FTS5 table (`message_search`) in `checkpoints.sqlite`: it holds only the word index, never a copy of the text, and snippets are cut from the conversation itself for the results shown. It is refreshed for any conversation that changed since the last search, with no model calls.
+- **🗑 Delete conversation** (sidebar, with a confirm step) removes a conversation's messages, search entries and star for good. It's disabled while a turn is running there.
+- **Only the latest state is kept.** LangGraph saves a checkpoint after every step of every turn; once a turn finishes, the conversation's older checkpoints and the researchers' sub-run checkpoints are deleted (`prune` in `conversations.py`), and the app does the same for every idle conversation when it starts. Storage then grows with the number of messages, not with turns × steps. Stop and failure rollback still work, since a running conversation is never pruned; what's lost is stepping back to older steps, which the app never does.
+- Replies stream in as they're written, with LaTeX rendered. If a reply call is retried, the text from the failed attempt is cleared instead of staying above the new one.
 - **⏹ Stop** cancels a reply mid-way and puts your prompt back in the box to edit. A turn that **fails** (for example after every retry timed out) is undone the same way: the conversation is left unchanged, the error is shown, and your question is back in the box to resend.
+- **One turn per conversation at a time.** Sending in a conversation whose turn is still running in another tab is refused (the question goes back in the box): two turns started from the same saved state would overwrite each other's reply. The terminal chat (`ml_researcher.chat`) doesn't take part in this check.
+- **Unanswered questions.** A turn that dies without being undone (the app restarted mid-turn, say) leaves its question with no reply. A conversation holding such questions shows a warning with **Remove unanswered questions**; a question left at the end goes back in the box.
 - **Copy** under every prompt and reply opens its raw text (markdown and LaTeX source) with a copy icon.
 - The sidebar shows the search queries used and the raw findings from each source.
 - You can download the last reply as Markdown.
@@ -215,7 +225,34 @@ streamlit run ui.py
 python -m ml_researcher.chat --thread flow-matching    # reuse a thread name to continue it
 ```
 
-Commands: `/state`, `/graph` (prints a Mermaid diagram), `/quit`.
+Commands: `/state`, `/graph` (prints a Mermaid diagram), `/remember <fact>`, `/quit`; add `/memory` to a message to use long-term memory.
+
+### Long-term memory
+
+The assistant remembers lasting facts about you across conversations, the way the *Generative Agents* paper (Park et al., 2023) does, and uses them only when you ask: put **`/memory`** anywhere in a message.
+
+- **What is stored.**
+  - **Memories:** short statements in a Chroma collection (`ml_memory_<model>_<dim>`, next to your notes), each with an importance from 1 to 10, when it was created and last used, its kind (`fact`, `preference`, `reflection` or `noted`) and the conversation it came from.
+  - **Profile:** a few key-value facts in `~/.ml_researcher/memory.json` (learning style, current project, level, tools). You can edit the file by hand.
+- **How memories are written.**
+  - **Automatically:** after every finished turn, one call to the researcher model extracts at most 3 lasting facts about you, plus profile updates. It runs in the background after the reply, so it adds no wait. Set `MEMORY_AUTO=false` to turn it off.
+  - **By hand:** `/remember I'm preparing for an interview in December` adds a memory (its importance is rated by one call); `/remember learning style: derivations first` sets a profile fact. Neither starts a turn.
+  - A new memory nearly identical to an old one (cosine ≥ 0.92) refreshes the old one instead of adding a copy.
+  - **Reflection:** once the memories written since the last reflection add up to `MEMORY_REFLECT_AT` importance (150), the model writes up to 3 higher-level insights that cite them. They're stored as `reflection` memories and recalled like any other.
+- **How recall ranks memories** (only on `/memory` turns), over the `MEMORY_CANDIDATES` nearest memories:
+
+  `score = recency + importance + relevance`, each min-max scaled to 0–1, weighted by `MEMORY_WEIGHTS` (default `1,1,1`)
+
+  - **recency** = `MEMORY_DECAY` (0.995) ^ hours since the memory was last used;
+  - **importance** = rating / 10;
+  - **relevance** = cosine similarity to your message.
+
+  The top `MEMORY_TOP_K` (8) go in, with the whole profile, as a `WHAT I REMEMBER ABOUT YOU` block: in the findings on research turns, in the system prompt on answer turns. The block is marked as data and is only for fitting the answer to you, never a source. Recalled memories count as used, so what keeps helping stays fresh. Recall costs one embedding call; the sidebar's **Memories used in the last turn** shows what went in.
+- **Your control.**
+  - The sidebar's **🧠 Memory** panel lists every profile fact and memory, each with ✕ to delete.
+  - Deleting a conversation also deletes the memories learned from it.
+  - Everything stays in the owner-only data folder.
+  - Logs: `memory_write`, `memory_recall`, `memory_reflect`, `memory_error`.
 
 ### Changing prompts
 
@@ -393,8 +430,10 @@ ruff format --diff .  # preview formatting changes (ruff format . applies them)
 | Path | What it does |
 |---|---|
 | `ui.py` | Streamlit entry point (`streamlit run ui.py`): registers the two pages and keeps the sidebar's collapse button visible |
-| `app_pages/researcher.py` | the **Researcher** page: the chat, with streaming replies, ⏹ Stop, copy buttons, ↑/↓ prompt history, LaTeX rendering, conversations in the sidebar |
+| `app_pages/researcher.py` | the **Researcher** page: the chat, with streaming replies, ⏹ Stop, copy buttons, ↑/↓ prompt history, LaTeX rendering, conversations and message search in the sidebar, one turn per conversation at a time |
 | `ml_researcher/chat.py` | terminal chat |
+| `ml_researcher/memory.py` | long-term memory (Generative Agents): memories in Chroma, the key-value profile, recall by recency + importance + relevance, extraction after each turn, reflection, `/remember` |
+| `ml_researcher/conversations.py` | conversation storage: pruning checkpoint history, deleting a conversation, message search (contentless SQLite FTS5 index), finding and removing unanswered questions; `--compact` for the one-time shrink |
 | `ml_researcher/runner.py` | runs one turn: streaming, cancellation, telemetry (latency, TTFT, TPOT, tokens) |
 
 **Agent**
@@ -446,6 +485,14 @@ ruff format --diff .  # preview formatting changes (ruff format . applies them)
 | `scripts/daily_ingest.sh` | daily incremental re-index, run by Windows Task Scheduler |
 | `scripts/run_eval.sh` | generation eval as a detached, resumable batch job |
 | `test_readers.py`, `inspect_db.py` | check what one file extracts to; inspect the index (with an optional test search) |
+
+**Data on disk.** `~/.ml_researcher/` and `logs/` are created owner-only (`700`), since conversations and logs hold your questions. Upgrading from before November 2026, shrink the checkpoint file once, with the app stopped:
+
+```bash
+python -m ml_researcher.conversations --compact   # prune every conversation, VACUUM, folders 700 / files 600
+```
+
+It checks that every conversation's messages, summary and latest brief are unchanged before shrinking (57 MB → about 2 MB here), switches the file to incremental auto-vacuum so later prunes give space back, and deletes old `checkpoints.backup-*.sqlite` copies.
 
 All runtime data lives in `~/.ml_researcher/`: the vector database, saved conversations (and their stars), the caption cache, logs, and `pacer.slot` (the shared rate-limit clock). The only exception is evaluation output, which is written to `evals/` in the project so it can be versioned.
 

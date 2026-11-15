@@ -48,6 +48,14 @@ RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "15"))     # fused hits s
 COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
 CHECKPOINT_DB = Path(os.path.expanduser(os.getenv("CHECKPOINT_DB", "~/.ml_researcher/checkpoints.sqlite")))
 
+MEMORY_FILE = Path(os.path.expanduser(os.getenv("MEMORY_FILE", "~/.ml_researcher/memory.json")))  # profile facts
+MEMORY_AUTO = os.getenv("MEMORY_AUTO", "true").lower() == "true"     # mine every finished turn for memories
+MEMORY_TOP_K = int(os.getenv("MEMORY_TOP_K", "8"))                    # memories recalled per /memory turn
+MEMORY_CANDIDATES = int(os.getenv("MEMORY_CANDIDATES", "200"))        # nearest memories scored per recall
+MEMORY_DECAY = float(os.getenv("MEMORY_DECAY", "0.995"))              # recency = DECAY ** hours since last use
+MEMORY_WEIGHTS = tuple(float(w) for w in os.getenv("MEMORY_WEIGHTS", "1,1,1").split(","))  # recency, importance, relevance
+MEMORY_REFLECT_AT = int(os.getenv("MEMORY_REFLECT_AT", "150"))        # importance sum that triggers a reflection
+
 LOG_DIR = Path(os.path.expanduser(os.getenv("LOG_DIR", "~/.ml_researcher/logs")))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_TO_GCP = os.getenv("LOG_TO_GCP", "false").lower() == "true"   # also ship logs to Cloud Logging
@@ -62,3 +70,18 @@ RAG_CORPUS_NAME = os.getenv("RAG_CORPUS_NAME", "ml-notes")
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+
+DATA_DIR = Path(os.path.expanduser("~/.ml_researcher"))
+
+
+def private_dir(path: Path) -> Path:
+    """Create `path` (and parents). Folders in the app's own DATA_DIR are made owner-only: conversations and logs
+    hold your questions, and files inside a 700 folder are protected whatever their own mode. A folder set
+    elsewhere in .env is created but its permissions are left alone."""
+    path.mkdir(parents=True, exist_ok=True)
+    if path == DATA_DIR or DATA_DIR in path.parents:
+        try:
+            path.chmod(0o700)
+        except OSError:                              # e.g. a folder on a Windows drive: leave it
+            pass
+    return path
